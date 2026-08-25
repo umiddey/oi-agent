@@ -1,0 +1,10 @@
+services:
+  oi-agent:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./config:/home/oi/.config/oi  # config.toml (set db_path = "/data/state.db")
+      - ./state:/data                 # sqlite state survives rebuilds
+      - /srv/repos:/srv/repos:rw      # clones; remote creds MUST be read-scoped
+    # Egress allowlist is enforced at the host firewall level, not here.

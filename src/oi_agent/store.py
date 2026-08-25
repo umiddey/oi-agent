@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS idx_posts_channel_ts ON posts(channel_id, ts);
 -- (Discord itself is the canonical thread history), so keeping it only meant
 -- unbounded growth. Existing databases lose the table on first open.
 DROP TABLE IF EXISTS messages;
+-- Migration: legacy draft-digest archive from a removed feature; zero
+-- readers since the rolling-memory redesign. Drop like `messages`.
+DROP TABLE IF EXISTS digests;
 """
 
 

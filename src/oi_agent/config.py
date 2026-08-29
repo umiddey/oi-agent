@@ -14,6 +14,8 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "oi" / "config.toml"
 DEFAULT_SECRETS_PATH = Path.home() / ".config" / "oi" / ".env"
+DISCORD_MAX_MESSAGE_CHARS = 2_000
+REPLY_DELIVERY_MODES = ("chunked", "single_message")
 
 DEFAULT_PERSONALITY = (
     "A sharp, witty senior engineer. Dry humor, opinionated, direct. Call out "
@@ -71,10 +73,8 @@ class WatchTarget:
         channel_id: Discord channel id to watch.
         repo_path: Local watched clone this channel's questions audit (OI
             runs git pull and writes .oi/ there; see README safety model).
-        founder_ids: Author ids whose messages always pass the gate.
         bot_user_id: Bot application user id considered 'mentioned' in tags.
         post_hourly_cap: Max autonomous replies per trailing hour.
-        claim_keywords: Lowercase substrings that force a response.
         search_stopwords: Extra domain words excluded from evidence search,
             merged over the built-in neutral filler-word list.
         search_aliases: Per-domain term expansion for repo search, e.g.
@@ -87,19 +87,12 @@ class WatchTarget:
 
     channel_id: int
     repo_path: str
-    founder_ids: list[int] = field(default_factory=list)
     bot_user_id: int = 0
     post_hourly_cap: int = 3
     search_aliases: dict[str, list[str]] = field(default_factory=dict)
     preferred_tokens: list[str] = field(default_factory=list)
     search_stopwords: list[str] = field(default_factory=list)
     max_tool_iterations: int | None = None
-    claim_keywords: list[str] = field(
-        default_factory=lambda: [
-            "plan", "commit", "migration", "deployed", "deploy",
-            "broken", "bug", "merged", "release", "model", "schema",
-        ]
-    )
 
 
 @dataclass
@@ -111,7 +104,9 @@ class Config:
         db_path: State database path.
         personality: User-selected response tone; safety/evidence rules remain
             authoritative.
-        max_reply_chars: Total reply cap before Discord-safe chunking.
+        max_reply_chars: Total logical answer cap before delivery-mode handling.
+        reply_delivery: Discord delivery policy: ``chunked`` preserves the
+            compatibility behavior; ``single_message`` requires one message.
         max_response_tokens: LLM output-token budget for a repo-audit answer.
             Reasoning models spend part of this on hidden reasoning, so keep it
             comfortably above the visible answer length.
@@ -126,6 +121,7 @@ class Config:
     db_path: str = "~/.local/state/oi/state.db"
     personality: str = DEFAULT_PERSONALITY
     max_reply_chars: int = 2_000
+    reply_delivery: str = "chunked"
     max_response_tokens: int = 4_000
     fallback: LLMConfig = field(
         default_factory=lambda: LLMConfig(
@@ -216,6 +212,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         db_path=_str(raw, "db_path", cfg_default_db()),
         personality=_str(raw, "personality", DEFAULT_PERSONALITY),
         max_reply_chars=_int(raw, "max_reply_chars", 2_000),
+        reply_delivery=_str(raw, "reply_delivery", "chunked"),
         max_response_tokens=_int(raw, "max_response_tokens", 4_000),
         max_tool_iterations=_int(raw, "max_tool_iterations", 4),
     )
@@ -240,10 +237,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         for req in ("channel_id", "repo_path"):
             if req not in w:
                 raise ValueError(f"watch entry missing '{req}': {w}")
-        default_kw = [
-            "plan", "commit", "migration", "deployed", "deploy",
-            "broken", "bug", "merged", "release", "model", "schema",
-        ]
         aliases_raw = w.get("search_aliases", {})
         if not isinstance(aliases_raw, dict):
             raise ValueError("search_aliases must be a table")
@@ -256,19 +249,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
                     for value in expansions):
                 raise ValueError(f"search_aliases[{term!r}] must be a list "
                                  "of non-empty strings")
-        founder_raw = w.get("founder_ids", [])
-        if not isinstance(founder_raw, list) or any(
-                isinstance(x, bool) or not isinstance(x, int)
-                for x in founder_raw):
-            raise ValueError("founder_ids must be a list of integers")
         cfg.watches.append(WatchTarget(
             channel_id=_int(w, "channel_id", 0),
             repo_path=_str(w, "repo_path", ""),
-            founder_ids=list(founder_raw),
             bot_user_id=_int(w, "bot_user_id", 0),
             post_hourly_cap=_int(w, "post_hourly_cap", 3),
-            claim_keywords=[k.lower()
-                            for k in _str_list(w, "claim_keywords", default_kw)],
             search_aliases={term: list(expansions)
                             for term, expansions in aliases_raw.items()},
             preferred_tokens=_str_list(w, "preferred_tokens", []),
@@ -301,6 +286,10 @@ def validate_config(cfg: Config) -> None:
     for name in ("discord_token_env", "db_path"):
         if not str(getattr(cfg, name, "")).strip():
             raise ValueError(f"{name} must be a non-empty string")
+    if cfg.reply_delivery not in REPLY_DELIVERY_MODES:
+        raise ValueError("reply_delivery must be one of "
+                         f"{REPLY_DELIVERY_MODES!r} "
+                         f"(got {cfg.reply_delivery!r})")
     for name, minimum in (("max_reply_chars", 200),
                           ("max_response_tokens", 256)):
         value = getattr(cfg, name)
@@ -309,6 +298,12 @@ def validate_config(cfg: Config) -> None:
             raise ValueError(f"{name} must be an integer (got {value!r})")
         if value < minimum:
             raise ValueError(f"{name} must be >= {minimum} (got {value})")
+    if cfg.reply_delivery == "single_message" \
+            and cfg.max_reply_chars > DISCORD_MAX_MESSAGE_CHARS:
+        raise ValueError(
+            "max_reply_chars must be <= 2000 when "
+            "reply_delivery='single_message' "
+            f"(got {cfg.max_reply_chars})")
     value = cfg.max_tool_iterations
     # bool is an int subclass but never a legitimate loop depth.
     if isinstance(value, bool) or not isinstance(value, int) \
@@ -349,17 +344,6 @@ def validate_config(cfg: Config) -> None:
                 or not isinstance(t.bot_user_id, int) or t.bot_user_id < 0:
             raise ValueError("bot_user_id must be a non-negative integer "
                              f"(got {t.bot_user_id!r})")
-        for fid in t.founder_ids:
-            if isinstance(fid, bool) or not isinstance(fid, int):
-                raise ValueError(
-                    f"founder_ids must be integers (got {fid!r})")
-        for collection, label in ((t.claim_keywords, "claim_keywords"),
-                                  (t.preferred_tokens, "preferred_tokens"),
-                                  (t.search_stopwords, "search_stopwords")):
-            for item in collection:
-                if not isinstance(item, str) or not item.strip():
-                    raise ValueError(f"{label} entries must be non-empty "
-                                     f"strings (got {item!r})")
         for term, expansions in t.search_aliases.items():
             if not isinstance(term, str) or not term.strip():
                 raise ValueError(f"search_aliases keys must be non-empty "
@@ -432,6 +416,7 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
         f'db_path = {json.dumps(cfg.db_path)}',
         f'personality = {json.dumps(cfg.personality)}',
         f"max_reply_chars = {cfg.max_reply_chars}",
+        f"reply_delivery = {json.dumps(cfg.reply_delivery)}",
         f"max_response_tokens = {cfg.max_response_tokens}",
         f"max_tool_iterations = {cfg.max_tool_iterations}",
         "",
@@ -455,10 +440,8 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
             "[[watch]]",
             f"channel_id = {t.channel_id}",
             f"repo_path = {json.dumps(t.repo_path)}",
-            f"founder_ids = {t.founder_ids}",
             f"bot_user_id = {t.bot_user_id}",
             f"post_hourly_cap = {t.post_hourly_cap}",
-            f"claim_keywords = {json.dumps(t.claim_keywords)}",
             *([f"max_tool_iterations = {t.max_tool_iterations}"]
               if t.max_tool_iterations is not None else []),
             f"search_aliases = {_toml_inline_table(t.search_aliases)}",

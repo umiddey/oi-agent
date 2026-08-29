@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 import discord
 
@@ -20,6 +21,7 @@ from .gate import Action, evaluate
 logger = logging.getLogger(__name__)
 
 EXCERPT_LIMIT = 40
+BURST_QUIET_SECONDS = 8.0
 MAX_CONCURRENT_AUDITS_PER_CHANNEL = 2
 
 
@@ -76,6 +78,21 @@ async def _thread_excerpt(
     return "\n".join(lines)
 
 
+@dataclass
+class _ConversationState:
+    """Latest trigger and scheduler handles for one Discord conversation."""
+
+    channel_id: int
+    target: object
+    owner_channel_id: int
+    author_name: str
+    question: str
+    reply_channel: discord.abc.Messageable | None
+    generation: int = 0
+    debounce_task: asyncio.Task | None = None
+    work_task: asyncio.Task | None = None
+
+
 class OIWatcher(discord.Client):
     """Gateway client implementing the full message pipeline."""
 
@@ -94,10 +111,9 @@ class OIWatcher(discord.Client):
         self._cfg = cfg
         self._store = store
         self._token: str | None = None
-        # Bound concurrent audits per channel so a burst of messages cannot all
-        # pass the cap read and launch parallel audit+LLM work. The atomic
-        # posting reservation is still the authoritative outbound gate; this
-        # caps inbound work under untrusted traffic.
+        # One audit per conversation is enough; separate threads may still
+        # share a bounded channel-level concurrency limit.
+        self._conversations: dict[int, _ConversationState] = {}
         self._channel_sems: dict[int, asyncio.Semaphore] = {}
 
     def _channel_semaphore(self, channel_id: int) -> asyncio.Semaphore:
@@ -143,6 +159,116 @@ class OIWatcher(discord.Client):
                 return target, target.channel_id
         return None, None
 
+    def _queue_reply_path(self, target, author_name: str, question: str,
+                          reply_to_channel_id: int,
+                          owner_channel_id: int, reply_channel=None) -> None:
+        """Coalesce one admitted event into the conversation scheduler.
+
+        A new event replaces the pending trigger and resets the quiet-period
+        timer. When work is already running, it only advances the generation;
+        the completion path schedules one follow-up for the newer burst.
+
+        Args:
+            target: Resolved watch target.
+            author_name: Sender display name.
+            question: Message text.
+            reply_to_channel_id: Channel/thread receiving the reply.
+            owner_channel_id: Owning watch-target id used for caps.
+            reply_channel: Event channel object used for uncached threads.
+        """
+        state = self._conversations.get(reply_to_channel_id)
+        if state is None:
+            state = _ConversationState(
+                channel_id=reply_to_channel_id,
+                target=target,
+                owner_channel_id=owner_channel_id,
+                author_name=author_name,
+                question=question,
+                reply_channel=reply_channel,
+            )
+            self._conversations[reply_to_channel_id] = state
+        else:
+            state.target = target
+            state.owner_channel_id = owner_channel_id
+            state.author_name = author_name
+            state.question = question
+            state.reply_channel = reply_channel
+        state.generation += 1
+
+        if state.work_task and not state.work_task.done():
+            logger.info("[watcher] coalesced message in %s during audit",
+                        reply_to_channel_id)
+            return
+        if state.debounce_task and not state.debounce_task.done():
+            state.debounce_task.cancel()
+        state.debounce_task = asyncio.create_task(
+            self._flush_conversation(state, state.generation)
+        )
+
+    def _extend_pending_burst(self, channel_id: int) -> None:
+        """Extend a pending burst without turning chatter into a new request.
+
+        Messages after an explicit trigger often arrive as unmarked
+        voice-to-text fragments. They reset the quiet period while work has
+        not started, but retain the original explicit question and never
+        create a new audit after work is already running.
+
+        Args:
+            channel_id: Conversation whose pending quiet period may extend.
+        """
+        state = self._conversations.get(channel_id)
+        if state is None or (state.work_task and not state.work_task.done()):
+            return
+        state.generation += 1
+        if state.debounce_task and not state.debounce_task.done():
+            state.debounce_task.cancel()
+        state.debounce_task = asyncio.create_task(
+            self._flush_conversation(state, state.generation)
+        )
+        logger.info("[watcher] extended pending burst in %s", channel_id)
+
+
+    async def _flush_conversation(self, state: _ConversationState,
+                                  scheduled_generation: int) -> None:
+        """Run one quiet-period flush and schedule a newer burst if needed.
+
+        Args:
+            state: Conversation state being flushed.
+            scheduled_generation: Generation captured when the timer started.
+        """
+        try:
+            await asyncio.sleep(BURST_QUIET_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if (self._conversations.get(state.channel_id) is not state
+                or state.generation != scheduled_generation):
+            return
+
+        state.debounce_task = None
+        completed_generation = state.generation
+        state.work_task = asyncio.current_task()
+        try:
+            await self._handle_reply_path(
+                state.target,
+                state.author_name,
+                state.question,
+                state.channel_id,
+                state.owner_channel_id,
+                state.reply_channel,
+            )
+        finally:
+            if self._conversations.get(state.channel_id) is not state:
+                return
+            state.work_task = None
+            if state.generation != completed_generation:
+                # A trigger arrived while work was running. Start one fresh
+                # quiet period rather than launching a second parallel audit.
+                state.debounce_task = asyncio.create_task(
+                    self._flush_conversation(state, state.generation)
+                )
+            else:
+                self._conversations.pop(state.channel_id, None)
+
     async def _handle_reply_path(self, target, author_name: str,
                                  question: str,
                                  reply_to_channel_id: int,
@@ -153,7 +279,7 @@ class OIWatcher(discord.Client):
         Args:
             target: Resolved watch target.
             author_name: Sender display name.
-            question: Message text.
+            question: Message text to answer.
             reply_to_channel_id: Channel/thread to post into.
             owner_channel_id: Owning watch-target id (cap/allowlist key).
             reply_channel: Event channel object used for uncached threads.
@@ -169,14 +295,7 @@ class OIWatcher(discord.Client):
             logger.info("[watcher] cap spent; skipping audit for %s",
                         owner_channel_id)
             return
-        # Bound concurrent audits per channel: if the channel is already at its
-        # in-flight limit, drop this message rather than pile on parallel
-        # audit+LLM work under a burst.
         sem = self._channel_semaphore(owner_channel_id)
-        if sem.locked():
-            logger.info("[watcher] channel %s at audit concurrency limit; "
-                        "dropping message", owner_channel_id)
-            return
         async with sem:
             excerpt = await _thread_excerpt(
                 reply_channel or self.get_channel(reply_to_channel_id))
@@ -224,7 +343,7 @@ class OIWatcher(discord.Client):
                 logger.warning("[watcher] memory update failed", exc_info=True)
 
     async def on_message(self, message: discord.Message) -> None:
-        """Main pipeline entry point for every gateway message event.
+        """Queue explicit requests from the Gateway without doing work inline.
 
         Args:
             message: Incoming Discord message.
@@ -241,18 +360,15 @@ class OIWatcher(discord.Client):
         decision = evaluate(
             content=message.content or "",
             mention_ids=mention_ids,
-            author_id=message.author.id,
             bot_user_id=target.bot_user_id,
-            founder_ids=target.founder_ids,
-            claim_keywords=target.claim_keywords,
         )
         logger.info("[watcher] %s %s in %s", decision.action.value,
                     decision.reason, message.channel.id)
         if decision.action == Action.IGNORE:
+            self._extend_pending_burst(message.channel.id)
             return
 
-        # Every gated message goes directly to the main evidence responder.
-        await self._handle_reply_path(
+        self._queue_reply_path(
             target, message.author.display_name, message.content or "",
             reply_to_channel_id=message.channel.id,
             owner_channel_id=owner,
@@ -267,6 +383,17 @@ class OIWatcher(discord.Client):
         """
         self._token = token
         super().run(token)
+
+
+def run_daemon(cfg: Config, store: Store, token: str) -> None:
+    """Blocking entry point that runs the watcher until interrupted.
+
+    Args:
+        cfg: Loaded daemon config.
+        store: Shared state store.
+        token: Discord bot token.
+    """
+    OIWatcher(cfg, store).run_with_token(token)
 
 
 def run_daemon(cfg: Config, store: Store, token: str) -> None:

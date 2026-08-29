@@ -56,8 +56,9 @@ oi pause     # kill switch
 discord_token_env = "OI_DISCORD_TOKEN"
 db_path = "~/.local/state/oi/state.db"
 personality = "A sharp, witty senior engineer. Dry humor, opinionated, direct."
-max_reply_chars = 2000
-max_response_tokens = 4000   # LLM output budget; raise for reasoning models
+max_reply_chars = 2000      # total logical answer cap
+reply_delivery = "chunked"  # "single_message" requires max_reply_chars <= 2000
+max_response_tokens = 4000  # LLM output budget; raise for reasoning models
 
 [fallback]
 base_url = "https://llm.example/v1"   # small model, only after main failure
@@ -70,7 +71,6 @@ model = "qwen3-27b"
 [[watch]]
 channel_id = 123456789012345678
 repo_path = "/srv/repos/your-repo"
-founder_ids = [234567890123456789]
 bot_user_id = 345678901234567890
 post_hourly_cap = 3
 
@@ -81,21 +81,34 @@ search_stopwords = ["scratch"]
 ```
 
 Add as many `[[watch]]` blocks as you like — one gateway connection serves
-them all; each keeps its own repo binding, founders, cap, vocabulary and
-state. `search_aliases` expands question terms before grepping the repo,
+them all; each keeps its own repo binding, cap, vocabulary and state.
+Messages must explicitly mention the bot, start with `oi:`, or contain
+`#oi`, `#audit`, or `#bugreport`. Founder identity and ordinary claim words
+do not trigger replies. Admitted messages are coalesced during a short quiet
+period so a burst produces one latest-context response per conversation.
+`search_aliases` expands question terms before grepping the repo,
 `preferred_tokens` ranks which evidence files get quoted, and
 `search_stopwords` filters deployment-specific noise words out of search.
 
 ## Message pipeline
 
 ```
-gateway event -> deterministic gate -> main responder -> poster
-                         |                 |
-                      IGNORE        fallback model on failure
+gateway event -> explicit gate -> quiet-period coalescer -> responder -> poster
+                    |                         |                |
+                 IGNORE                 latest burst      one or more Discord
+                                                        messages (delivery mode)
 ```
 
-Every posted answer is stamped `audited at <sha>` with the manifest SHA it
-was built from.
+At most one response runs per conversation at a time. Every posted answer is
+stamped `audited at <sha>` with the manifest SHA it was built from.
+`max_reply_chars` is the total logical answer cap, independent of Discord's
+2,000-character per-message limit. With the compatibility-default
+`reply_delivery = "chunked"`, an answer up to that cap is split into as many
+Discord-safe messages as needed. Set `reply_delivery = "single_message"` for
+a strict one-message policy; its cap must be at most 2,000, and a response
+that cannot fit one message is not posted.
+The Gateway remains a long-lived outbound WebSocket; OI does not expose an
+inbound HTTP listener or poll Discord REST for messages.
 
 ## Development
 

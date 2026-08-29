@@ -61,18 +61,6 @@ def _prompt_int(label: str, default: int) -> int:
             console.print("[red]must be a number[/red]")
 
 
-def _prompt_founder_ids() -> list[int]:
-    """Prompt for comma-separated Discord user ids until all parse.
-
-    Returns:
-        Parsed founder ids (empty list allowed).
-    """
-    while True:
-        raw = typer.prompt("founder ids (comma separated)", default="")
-        try:
-            return [int(x) for x in raw.split(",") if x.strip()]
-        except ValueError:
-            console.print("[red]founder ids must be numbers[/red]")
 
 @app.command()
 def init() -> None:
@@ -168,12 +156,11 @@ def init() -> None:
         if not (repo_path / ".git").exists():
             console.print(f"[red]{repo_path} is not a git clone, skipping[/red]")
             continue
-        founders = _prompt_founder_ids()
         bot_user_id = _prompt_int("bot user id", 0)
         cap = _prompt_int("posts per hour cap", 3)
         cfg.watches.append(WatchTarget(
             channel_id=channel_id, repo_path=str(repo_path),
-            founder_ids=founders, bot_user_id=bot_user_id,
+            bot_user_id=bot_user_id,
             post_hourly_cap=cap,
         ))
     if not cfg.watches:
@@ -296,6 +283,7 @@ def config_show(
     console.print(f"[bold]config:[/bold] {config}")
     console.print(f"personality = {cfg.personality}")
     console.print(f"max_reply_chars = {cfg.max_reply_chars}")
+    console.print(f"reply_delivery = {cfg.reply_delivery}")
     console.print(f"max_response_tokens = {cfg.max_response_tokens}")
     console.print(f"max_tool_iterations = {cfg.max_tool_iterations}")
     for name in ("fallback", "agent"):
@@ -308,7 +296,6 @@ def config_show(
     for t in cfg.watches:
         console.print(
             f"[watch] channel {t.channel_id} -> {t.repo_path} | "
-            f"founders {t.founder_ids} | bot {t.bot_user_id} | "
             f"cap {t.post_hourly_cap}/h")
 
 
@@ -348,15 +335,15 @@ def config_set(
     value: str = typer.Argument(...),
     config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c"),
 ) -> None:
-    """Change one setting. Keys: personality, max_reply_chars,
+    """Change one setting. Keys: personality, max_reply_chars, reply_delivery,
     max_response_tokens, max_tool_iterations, discord_token_env, db_path,
     fallback.base_url|model|api_key_env|api_style|disable_thinking,
     agent.base_url|model|api_key_env|api_style|disable_thinking."""
     cfg = _load_or_die(config)
     section, _, leaf = key.partition(".")
     allowed_sections = {
-        "personality", "max_reply_chars", "max_response_tokens",
-        "max_tool_iterations",
+        "personality", "max_reply_chars", "reply_delivery",
+        "max_response_tokens", "max_tool_iterations",
         "discord_token_env", "db_path", "fallback", "agent",
     }
     llm_keys = {"base_url", "model", "api_key_env", "api_style",
@@ -393,7 +380,6 @@ def config_set(
 def config_watch_add(
     channel_id: int = typer.Option(..., help="Discord channel to watch"),
     repo_path: str = typer.Option(..., help="local repo clone path"),
-    founder_ids: str = typer.Option("", help="comma-separated author ids"),
     bot_user_id: int = typer.Option(0, help="bot user id (mention trigger)"),
     post_hourly_cap: int = typer.Option(3, help="max replies per hour"),
     config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c"),
@@ -404,14 +390,9 @@ def config_watch_add(
     if not (resolved / ".git").exists():
         console.print(f"[red]{resolved} is not a git clone[/red]")
         raise typer.Exit(1)
-    try:
-        founders = [int(x) for x in founder_ids.split(",") if x.strip()]
-    except ValueError:
-        console.print("[red]founder ids must be numbers[/red]")
-        raise typer.Exit(1)
     target = WatchTarget(
         channel_id=channel_id, repo_path=str(resolved),
-        founder_ids=founders, bot_user_id=bot_user_id,
+        bot_user_id=bot_user_id,
         post_hourly_cap=post_hourly_cap,
     )
     cfg.watches = [t for t in cfg.watches if t.channel_id != channel_id]

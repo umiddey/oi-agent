@@ -128,20 +128,6 @@ def test_config_set_below_minimum_rejected(tmp_path):
     assert cfg_path.read_bytes() == good  # byte-for-byte unchanged
 
 
-def test_watch_add_rejects_malformed_founder_ids(tmp_path):
-    """Non-numeric founder ids exit nonzero with a clean message."""
-    cfg_path = tmp_path / "config.toml"
-    base = tmp_path / "repo"
-    (base / ".git").mkdir(parents=True)
-
-    r = runner.invoke(app, ["config", "watch-add",
-                            "--channel-id", "111", "--repo-path", str(base),
-                            "--founder-ids", "abc,def",
-                            "--config", str(cfg_path)])
-
-    assert r.exit_code == 1
-    assert "founder ids must be numbers" in r.output
-    assert not cfg_path.exists()  # nothing was written
 
 
 def test_prompt_int_reprompts_on_garbage(monkeypatch):
@@ -171,12 +157,6 @@ def test_run_flags_are_honest_about_logging():
     assert "--log-answers" in r.output
     assert "PRIVACY-SENSITIVE" in r.output
 
-def test_prompt_founder_ids_reprompts_on_garbage(monkeypatch):
-    from oi_agent import cli
-
-    replies = iter(["a,b", "1, 2"])
-    monkeypatch.setattr(cli.typer, "prompt", lambda *a, **k: next(replies))
-    assert cli._prompt_founder_ids() == [1, 2]
 
 
 def test_config_set_and_show_max_tool_iterations(tmp_path):

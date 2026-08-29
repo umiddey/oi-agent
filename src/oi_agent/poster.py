@@ -12,13 +12,12 @@ import logging
 
 import httpx
 
+from .config import Config, DISCORD_MAX_MESSAGE_CHARS, REPLY_DELIVERY_MODES
 from .store import Store
-from .config import Config
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(30.0)
-MAX_DISCORD_MESSAGE_CHARS = 2_000
 
 
 def split_message(content: str, max_chars: int) -> list[str]:
@@ -34,14 +33,14 @@ def split_message(content: str, max_chars: int) -> list[str]:
     remaining = content[:max(0, max_chars)].strip()
     chunks: list[str] = []
     while remaining:
-        if len(remaining) <= MAX_DISCORD_MESSAGE_CHARS:
+        if len(remaining) <= DISCORD_MAX_MESSAGE_CHARS:
             chunks.append(remaining)
             break
-        cut = remaining.rfind("\n", 0, MAX_DISCORD_MESSAGE_CHARS + 1)
-        if cut < MAX_DISCORD_MESSAGE_CHARS // 2:
-            cut = remaining.rfind(" ", 0, MAX_DISCORD_MESSAGE_CHARS + 1)
+        cut = remaining.rfind("\n", 0, DISCORD_MAX_MESSAGE_CHARS + 1)
+        if cut < DISCORD_MAX_MESSAGE_CHARS // 2:
+            cut = remaining.rfind(" ", 0, DISCORD_MAX_MESSAGE_CHARS + 1)
         if cut <= 0:
-            cut = MAX_DISCORD_MESSAGE_CHARS
+            cut = DISCORD_MAX_MESSAGE_CHARS
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
     return chunks
@@ -67,12 +66,13 @@ class Poster:
 
     async def send(self, channel_id: int, target_channel_id: int,
                    content: str) -> bool:
-        """Post a capped reply as one or more Discord-safe chunks.
+        """Post one Discord-safe reply through the safety rails.
 
-        One reply consumes exactly one unit of the hourly cap (reserved
-        atomically up front), never one unit per chunk. Mentions in generated
-        text are suppressed: Discord parses no @everyone/@here/role/user
-        mentions from our output, so a hijacked model cannot mass-notify.
+        One reply consumes exactly one unit of the hourly cap. The configured
+        reply cap limits the total logical answer; ``chunked`` delivery sends
+        each Discord-safe chunk, while ``single_message`` requires one chunk.
+        Mentions in generated text are suppressed: Discord parses no
+        @everyone/@here/role/user mentions from our output.
 
         Args:
             channel_id: Destination channel/thread id.
@@ -80,9 +80,28 @@ class Poster:
             content: Full reply body.
 
         Returns:
-            True only when every chunk is sent.
+            True only when the reply is sent successfully.
         """
-        chunks = split_message(content, self._cfg.max_reply_chars)
+        delivery = getattr(self._cfg, "reply_delivery", None)
+        if delivery not in REPLY_DELIVERY_MODES:
+            logger.error("[poster] invalid reply_delivery: %r", delivery)
+            return False
+        reply_cap = self._cfg.max_reply_chars
+        if (isinstance(reply_cap, bool) or not isinstance(reply_cap, int)
+                or reply_cap < 200):
+            logger.error("[poster] invalid max_reply_chars: %r", reply_cap)
+            return False
+        if (delivery == "single_message"
+                and reply_cap > DISCORD_MAX_MESSAGE_CHARS):
+            logger.error(
+                "[poster] single_message requires max_reply_chars <= 2000 "
+                "(got %s)", reply_cap)
+            return False
+        chunks = split_message(content, reply_cap)
+        if delivery == "single_message" and len(chunks) != 1:
+            logger.error("[poster] single_message produced %d chunks",
+                         len(chunks))
+            return False
         if not chunks:
             return False
         # Reserve the whole reply atomically before the first network call so

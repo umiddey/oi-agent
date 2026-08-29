@@ -1,8 +1,8 @@
 """Mocked end-to-end tests for one Discord message event."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-
 import pytest
 
 from oi_agent.agent import responder
@@ -94,6 +94,12 @@ def _watcher(tmp_path, channel_id=111):
     return OIWatcher(cfg, Store(tmp_path / "state.db"))
 
 
+@pytest.fixture(autouse=True)
+def immediate_burst_flush(monkeypatch):
+    """Remove production debounce delay from isolated event-path tests."""
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
+
+
 @pytest.mark.asyncio
 async def test_direct_mention_runs_full_pipeline(tmp_path, monkeypatch):
     """A bot mention reaches audit, gets stamped, and passes to the poster."""
@@ -125,6 +131,7 @@ async def test_direct_mention_runs_full_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(discord_client.Poster, "send", fake_send)
 
     await watcher.on_message(message)
+    await asyncio.sleep(0.05)
 
     assert any(isinstance(call, str) and "Question:" in call for call in calls)
     posted = calls[-1]
@@ -134,6 +141,135 @@ async def test_direct_mention_runs_full_pipeline(tmp_path, monkeypatch):
     # nothing else: the message archive was removed as unbounded dead weight.
     _, exchanges = watcher._store.get_memory(111)
     assert len(exchanges) == 1
+
+
+
+@pytest.mark.asyncio
+async def test_trigger_burst_runs_one_latest_response(tmp_path, monkeypatch):
+    """A burst in one conversation produces one response for its latest event."""
+    watcher = _watcher(tmp_path)
+    channel = FakeChannel(111)
+    first = FakeMessage(
+        1, channel, FakeAuthor(7), "<@99> inspect the old thing",
+        [FakeMention(99)],
+    )
+    second = FakeMessage(
+        2, channel, FakeAuthor(7), "<@99> inspect the latest thing",
+        [FakeMention(99)],
+    )
+    channel._history = [second, first]
+    questions = []
+    posted = []
+
+    async def fake_responder(*args, **kwargs):
+        """Capture one coalesced responder invocation."""
+        questions.append(args[4])
+        return responder.Reply("coalesced answer", "abc123")
+
+    async def fake_send(self, channel_id, target_channel_id, content):
+        """Capture the single post at the poster boundary."""
+        posted.append((channel_id, target_channel_id, content))
+        return True
+
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(discord_client.responder, "respond", fake_responder)
+    monkeypatch.setattr(discord_client.Poster, "send", fake_send)
+
+    await watcher.on_message(first)
+    await watcher.on_message(second)
+    await asyncio.sleep(0.03)
+
+    assert questions == ["<@99> inspect the latest thing"]
+    assert posted == [(111, 111, "coalesced answer")]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_followup_extends_pending_burst(tmp_path, monkeypatch):
+    """Unmarked voice-to-text fragments extend a pending explicit request."""
+    watcher = _watcher(tmp_path)
+    channel = FakeChannel(111)
+    trigger = FakeMessage(
+        1, channel, FakeAuthor(7), "<@99> inspect this issue",
+        [FakeMention(99)],
+    )
+    followup = FakeMessage(
+        2, channel, FakeAuthor(7), "the screenshot is attached here", []
+    )
+    channel._history = [followup, trigger]
+    questions = []
+
+    async def fake_responder(*args, **kwargs):
+        """Capture the original explicit request."""
+        questions.append(args[4])
+        return responder.Reply("answer", "abc123")
+
+    async def fake_send(self, channel_id, target_channel_id, content):
+        """Accept the coalesced reply without network access."""
+        return True
+
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(discord_client.responder, "respond", fake_responder)
+    monkeypatch.setattr(discord_client.Poster, "send", fake_send)
+
+    await watcher.on_message(trigger)
+    await asyncio.sleep(0.005)
+    await watcher.on_message(followup)
+    await asyncio.sleep(0.03)
+    assert questions == [trigger.content]
+
+
+
+@pytest.mark.asyncio
+async def test_trigger_during_audit_gets_one_followup(tmp_path, monkeypatch):
+    """A newer trigger waits for the current audit instead of racing it."""
+    watcher = _watcher(tmp_path)
+    channel = FakeChannel(111)
+    first = FakeMessage(
+        1, channel, FakeAuthor(7), "<@99> inspect the first thing",
+        [FakeMention(99)],
+    )
+    second = FakeMessage(
+        2, channel, FakeAuthor(7), "<@99> inspect the follow-up",
+        [FakeMention(99)],
+    )
+    channel._history = [second, first]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    questions = []
+    posted = []
+
+    async def fake_responder(*args, **kwargs):
+        """Hold the first audit open while a newer event arrives."""
+        question = args[4]
+        questions.append(question)
+        if question == first.content:
+            started.set()
+            await release.wait()
+        return responder.Reply("answer", "abc123")
+
+    async def fake_send(self, channel_id, target_channel_id, content):
+        """Capture each completed coalesced response."""
+        posted.append(content)
+        return True
+
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
+    monkeypatch.setattr(discord_client.responder, "respond", fake_responder)
+    monkeypatch.setattr(discord_client.Poster, "send", fake_send)
+
+    await watcher.on_message(first)
+    await asyncio.sleep(0.02)
+    assert started.is_set()
+
+    await watcher.on_message(second)
+    await asyncio.sleep(0)
+    assert questions == [first.content]
+
+    release.set()
+    await asyncio.sleep(0.05)
+
+    assert questions == [first.content, second.content]
+    assert posted == ["answer", "answer"]
+
 
 
 @pytest.mark.asyncio
@@ -171,6 +307,7 @@ async def test_thread_memory_is_keyed_per_thread_not_parent(
     monkeypatch.setattr(discord_client.Poster, "send", fake_send)
 
     await watcher.on_message(message)
+    await asyncio.sleep(0.05)
 
     # Recall lives under the thread id...
     _, thread_exchanges = watcher._store.get_memory(222)
@@ -285,8 +422,8 @@ async def test_triage_failure_falls_through_to_audit(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_founder_message_goes_directly_to_responder(tmp_path, monkeypatch):
-    """A deterministic trigger reaches the main agent directly."""
+async def test_unmarked_founder_message_is_ignored(tmp_path, monkeypatch):
+    """Founder identity and claim words do not bypass the explicit gate."""
     watcher = _watcher(tmp_path)
     message = FakeMessage(
         2, FakeChannel(111), FakeAuthor(7), "the bug report is resolved", []
@@ -294,20 +431,15 @@ async def test_founder_message_goes_directly_to_responder(tmp_path, monkeypatch)
     calls = []
 
     async def fake_responder(*args, **kwargs):
-        """Capture the direct main-responder invocation."""
+        """Fail the test if ignored chatter reaches the responder."""
         calls.append((args, kwargs))
         return responder.Reply("short answer", "abc123")
 
-    async def fake_send(self, channel_id, target_channel_id, content):
-        """Prevent network access while proving the post boundary is reached."""
-        return True
-
     monkeypatch.setattr(discord_client.responder, "respond", fake_responder)
-    monkeypatch.setattr(discord_client.Poster, "send", fake_send)
 
     await watcher.on_message(message)
 
-    assert len(calls) == 1
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -335,6 +467,7 @@ async def test_context_failure_becomes_honest_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(discord_client.Poster, "send", fake_send)
 
     await watcher.on_message(message)
+    await asyncio.sleep(0.05)
 
     assert len(posted) == 1
     assert "Couldn't inspect the repository" in posted[0]

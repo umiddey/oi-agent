@@ -29,8 +29,8 @@ def test_split_message_applies_total_cap():
 
 
 @pytest.mark.asyncio
-async def test_poster_sends_chunks_as_one_reply_unit(tmp_path, monkeypatch):
-    """Long replies use multiple compliant REST requests but consume ONE cap unit."""
+async def test_poster_emits_chunked_reply_and_one_cap_unit(tmp_path, monkeypatch):
+    """Chunked delivery sends the full logical cap in Discord-safe chunks."""
     cfg = Config(max_reply_chars=4_500)
     cfg.watches = [WatchTarget(channel_id=111, repo_path="/repo",
                                post_hourly_cap=1)]
@@ -60,14 +60,45 @@ async def test_poster_sends_chunks_as_one_reply_unit(tmp_path, monkeypatch):
     content = "x" * 4_500
 
     assert await poster.send(111, 111, content) is True
-    assert len(calls) == 3
-    assert all(len(chunk) <= 2_000 for chunk, _ in calls)
-    assert sum(len(chunk) for chunk, _ in calls) == 4_500
-    # Mentions suppressed everywhere: no @everyone/@here/role parsing.
+    assert [len(content) for content, _ in calls] == [2_000, 2_000, 500]
     assert all(mentions == {"parse": []} for _, mentions in calls)
+    assert "".join(content for content, _ in calls) == content
     # One reply = one unit of the hourly cap, and cap 1 is now exhausted.
     assert store.posts_in_last_hour(111) == 1
     assert await poster.send(111, 111, "next reply") is False
+
+
+@pytest.mark.asyncio
+async def test_poster_rejects_direct_single_message_cap(tmp_path, monkeypatch,
+                                                        caplog):
+    """Directly constructed strict configs cannot bypass the cap invariant."""
+    cfg = Config(max_reply_chars=4_500, reply_delivery="single_message")
+    cfg.watches = [WatchTarget(channel_id=111, repo_path="/repo")]
+    store = Store(tmp_path / "state.db")
+
+    class FakeClient:
+        """Async HTTP client that would expose an unexpected send."""
+        def __init__(self, *args, **kwargs):
+            """Accept the httpx client constructor arguments."""
+
+        async def __aenter__(self):
+            """Enter the fake client."""
+            return self
+
+        async def __aexit__(self, *args):
+            """Leave the fake client."""
+            return False
+
+        async def post(self, url, headers, json):
+            """Fail if invalid configuration reaches the network."""
+            raise AssertionError("invalid config must not send")
+
+    monkeypatch.setattr("oi_agent.poster.httpx.AsyncClient", FakeClient)
+    poster = Poster(cfg, store, "token")
+
+    assert await poster.send(111, 111, "reply") is False
+    assert "single_message" in caplog.text
+    assert store.posts_in_last_hour(111) == 0
 
 
 def test_reserve_post_is_atomic_against_the_cap(tmp_path):

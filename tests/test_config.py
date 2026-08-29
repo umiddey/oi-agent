@@ -20,25 +20,24 @@ def _write(path, text):
 def test_roundtrip(tmp_path):
     cfg = Config()
     cfg.personality = 'Warm "expert"\nUse bullets.'
-    cfg.max_reply_chars = 10_000
+    cfg.max_reply_chars = 2_000
     cfg.max_response_tokens = 8_192
     cfg.fallback = LLMConfig("http://a/v1", "m1", "K1")
     cfg.agent = LLMConfig("http://b/v1", "m2", "K2", disable_thinking=True)
     cfg.watches = [
         WatchTarget(channel_id=111, repo_path="/srv/repo",
-                    founder_ids=[234567890123456789], bot_user_id=42,
-                    post_hourly_cap=5),
+                    bot_user_id=42, post_hourly_cap=5),
         WatchTarget(channel_id=333, repo_path="/srv/other"),
     ]
     p = tmp_path / "config.toml"
     save_config(cfg, p)
     back = load_config(p)
-    assert back.max_reply_chars == 10_000
+    assert back.max_reply_chars == 2_000
+    assert back.reply_delivery == "chunked"
     assert back.max_response_tokens == 8_192
     assert back.personality == 'Warm "expert"\nUse bullets.'
     w = back.watches[0]
     assert (w.channel_id, w.bot_user_id, w.post_hourly_cap) == (111, 42, 5)
-    assert w.founder_ids == [234567890123456789]
     assert back.agent.disable_thinking is True
     assert back.fallback.disable_thinking is False
     assert back.target_for_channel(333).repo_path == "/srv/other"
@@ -132,12 +131,10 @@ def test_max_response_tokens_defaults_when_absent(tmp_path):
     "personality = [1]\n[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\n",
     "[[watch]]\nchannel_id = 1\nrepo_path = 42\n",
     "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\nbot_user_id = true\n",
-    "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\nfounder_ids = [true]\n",
     "[agent]\ndisable_thinking = \"false\"\n[[watch]]\nchannel_id = 1\n"
     "repo_path = \"/r\"\n",
     # Collection types must not silently coerce: bare string -> not char list,
     # and non-string list elements are rejected.
-    "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\nclaim_keywords = \"bug\"\n",
     "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\npreferred_tokens = [1]\n",
 ])
 def test_malformed_toml_types_are_rejected(tmp_path, bad_toml):
@@ -157,8 +154,7 @@ def test_save_survives_quotes_and_apostrophes(tmp_path):
     cfg.agent = LLMConfig(base_url='https://x/"bad', model='m',
                           api_key_env="K")
     cfg.watches = [
-        WatchTarget(channel_id=1, repo_path='/srv/o"brien',
-                    claim_keywords=["it's", "bug's"]),
+        WatchTarget(channel_id=1, repo_path='/srv/o"brien'),
     ]
     p = tmp_path / "config.toml"
 
@@ -167,7 +163,6 @@ def test_save_survives_quotes_and_apostrophes(tmp_path):
     back = load_config(p)  # must not raise TOMLDecodeError
     assert back.agent.base_url == 'https://x/"bad'
     assert back.watches[0].repo_path == '/srv/o"brien'
-    assert back.watches[0].claim_keywords == ["it's", "bug's"]
 
 
 def test_save_creates_missing_parent_dirs(tmp_path):
@@ -210,6 +205,47 @@ def test_invalid_on_disk_config_rejected_on_load(tmp_path):
 
     with pytest.raises(ValueError):
         load_config(p)
+
+
+def test_reply_cap_at_discord_limit_is_valid(tmp_path):
+    """The strict delivery mode accepts Discord's one-message maximum."""
+    cfg = Config(max_reply_chars=2_000, reply_delivery="single_message")
+    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
+    path = tmp_path / "reply-cap.toml"
+
+    save_config(cfg, path)
+
+    back = load_config(path)
+    assert back.max_reply_chars == 2_000
+    assert back.reply_delivery == "single_message"
+
+
+def test_single_message_rejects_cap_above_discord_limit(tmp_path):
+    """Strict one-message delivery cannot be paired with a larger cap."""
+    cfg = Config(max_reply_chars=2_001, reply_delivery="single_message")
+    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
+    path = tmp_path / "reply-cap.toml"
+
+    with pytest.raises(ValueError, match="single_message"):
+        save_config(cfg, path)
+
+    assert not path.exists()
+
+
+def test_invalid_reply_delivery_rejected(tmp_path):
+    """Only the documented delivery modes are accepted."""
+    cfg = Config(reply_delivery="bogus")
+    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
+    with pytest.raises(ValueError, match="reply_delivery"):
+        save_config(cfg, tmp_path / "reply-mode.toml")
+
+    path = _write(
+        tmp_path / "manual-reply-mode.toml",
+        'reply_delivery = "bogus"\n'
+        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n',
+    )
+    with pytest.raises(ValueError, match="reply_delivery"):
+        load_config(path)
 
 
 def test_negative_bot_user_id_and_bad_vocab_rejected(tmp_path):

@@ -634,9 +634,7 @@ class OpenCodeRunner:
             events, _ = stdout_task.result()
             text, _, selection_error, _ = _select_final_text(events)
             if selection_error is None and text:
-                text, marker_error = _extract_marked_answer(text)
-                if marker_error is None:
-                    return text
+                return text
             return None
         except asyncio.CancelledError:
             # Cancellation must not orphan the start_new_session process group.

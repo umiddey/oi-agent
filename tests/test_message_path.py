@@ -212,9 +212,15 @@ async def test_trigger_during_run_gets_one_followup(tmp_path, monkeypatch):
     assert questions == [first.content, second.content]
 
 
+@pytest.mark.parametrize(
+    "failure_class",
+    ["unknown_session", "protocol_missing_final_marker", "protocol_empty_final_answer"],
+)
 @pytest.mark.asyncio
-async def test_unknown_session_is_cleared_and_retried_once(tmp_path, monkeypatch):
-    """Only an unknown stored session triggers one fresh retry."""
+async def test_stale_session_is_cleared_and_retried_once(
+    tmp_path, monkeypatch, failure_class,
+):
+    """A stale or unframed stored session triggers one fresh retry."""
     watcher = _watcher(tmp_path)
     target = watcher._cfg.watches[0]
     watcher._store.set_opencode_session(111, target.repo_path, "stale")
@@ -227,7 +233,7 @@ async def test_unknown_session_is_cleared_and_retried_once(tmp_path, monkeypatch
         """Fail once as stale, then succeed fresh."""
         session_args.append(session_id)
         if len(session_args) == 1:
-            return Reply("failure", "sha", ok=False, error_class="unknown_session")
+            return Reply("failure", "sha", ok=False, error_class=failure_class)
         return Reply("answer", "sha", session_id="fresh")
 
     async def fake_deliver(self, *args, **kwargs):

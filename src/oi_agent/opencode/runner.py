@@ -348,8 +348,8 @@ def _select_final_text(
     return fail("protocol_no_final_message")
 
 def _extract_marked_answer(text: str) -> tuple[str, str | None]:
-    """Return only the explicitly framed user-facing answer."""
-    if text.count(FINAL_OUTPUT_MARKER) != 1:
+    """Return text after the last explicit final-output marker."""
+    if FINAL_OUTPUT_MARKER not in text:
         return "", "protocol_missing_final_marker"
     answer = text.rsplit(FINAL_OUTPUT_MARKER, 1)[1].strip()
     if not answer:

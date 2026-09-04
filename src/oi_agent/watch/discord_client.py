@@ -767,7 +767,11 @@ class OIWatcher(discord.Client):
                         session_id=session_id,
                         member_id=participant_id,
                     )
-                    if session_id and not reply.ok and reply.error_class == "unknown_session":
+                    if session_id and not reply.ok and reply.error_class in {
+                        "unknown_session",
+                        "protocol_missing_final_marker",
+                        "protocol_empty_final_answer",
+                    }:
                         self._store.clear_opencode_session(conversation_id, repo_path)
                         reply = await self._runner.run(
                             target,

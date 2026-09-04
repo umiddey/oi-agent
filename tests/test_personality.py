@@ -145,7 +145,7 @@ with open(trace, "w", encoding="utf-8") as handle:
                "xdg_config": os.environ.get("XDG_CONFIG_HOME", ""),
                "disable": os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG")}}, handle)
 part = {{"id": "p2", "messageID": "msg-1", "sessionID": "session-123",
-        "type": "text", "text": "UNIQUE_MARKER"}}
+        "type": "text", "text": "[[OI_FINAL_ANSWER]]\\nUNIQUE_MARKER"}}
 print(json.dumps({{"type": "step_start", "timestamp": 0, "sessionID": "session-123",
                   "part": {{"id": "p1", "messageID": "msg-1",
                            "sessionID": "session-123", "type": "step-start"}}}}))

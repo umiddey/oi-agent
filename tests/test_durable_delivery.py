@@ -28,6 +28,7 @@ import pytest
 from oi_agent.agent.reply import Reply
 from oi_agent.config import Config, WatchTarget
 from oi_agent.opencode.paths import resolve_opencode_paths
+from oi_agent.opencode.prompt import FINAL_OUTPUT_MARKER
 from oi_agent.opencode.provenance import worktree_fingerprint
 from oi_agent.opencode.review_target import provider_ref_template
 from oi_agent.poster import DeliveryResult
@@ -1046,7 +1047,9 @@ def _spam_opencode_script(
             "sessionID": session, "type": "step-start"}
     stream.append({"type": "step_start", "timestamp": 0, "sessionID": session, "part": part})
     part_index += 1
-    for final_text in final_parts:
+    for final_index, final_text in enumerate(final_parts):
+        if final_index == 0:
+            final_text = f"{FINAL_OUTPUT_MARKER}\n{final_text}"
         part = {"id": f"p{part_index}", "messageID": message,
                 "sessionID": session, "type": "text", "text": final_text}
         stream.append({"type": "text", "timestamp": 0, "sessionID": session, "part": part})

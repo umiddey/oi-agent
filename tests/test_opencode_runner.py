@@ -110,6 +110,11 @@ _HOSTILE_ERROR_EVENT = {"type": "error", "timestamp": 1, "sessionID": SESSION,
 
 _STREAMS = {
     "success": _pinned_stream([("p9", "UNIQUE_MARKER")]),
+    "raw": (
+        _tool_step("msg_narration_a", "tx1", "Checking the repository now.")
+        + _tool_step("msg_narration_b", "tx2", "Narrowing the answer down.")
+        + _final_step("msg_final", [("p9", "UNIQUE_MARKER")])
+    ),
     "multipart": _pinned_stream([
         ("p9", "ALPHA"), ("p10", "BETA"), ("p11", "GAMMA"), ("p9", "ALPHA"),
     ]),
@@ -393,7 +398,7 @@ async def test_runner_subprocess_spawn_oserror_returns_process_error(tmp_path, m
 async def test_run_raw_prompt_returns_only_final_message_text(tmp_path, monkeypatch):
     """run_raw_prompt returns exactly the final completed message, nothing else."""
     monkeypatch.setenv("HOME", str(tmp_path / "operator"))
-    binary, _ = _script(tmp_path)
+    binary, _ = _script(tmp_path, "raw")
     cfg = Config(
         opencode_binary=str(binary),
         opencode_model="provider/model",

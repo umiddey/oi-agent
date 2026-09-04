@@ -36,7 +36,7 @@ from oi_agent.watch.discord_client import OIWatcher
 class FakeAuthor:
     """Minimal Discord author object."""
 
-    def __init__(self, user_id: int, name: str = "user1", bot: bool = False) -> None:
+    def __init__(self, user_id: int, name: str = "alice", bot: bool = False) -> None:
         self.id = user_id
         self.display_name = name
         self.bot = bot
@@ -136,7 +136,16 @@ def _create_mock_opencode(tmp_path: Path, mutate_repo: Path | None = None) -> Pa
     body = f"""#!{sys.executable}
 import json, sys
 {mutate_snippet}
-print(json.dumps({{"type": "text", "sessionID": "sess-multi", "part": {{"text": "Multi-repo audit completed"}}}}))
+part = {{"id": "p2", "messageID": "msg-1", "sessionID": "sess-multi",
+        "type": "text", "text": "Multi-repo audit completed"}}
+print(json.dumps({{"type": "step_start", "timestamp": 0, "sessionID": "sess-multi",
+                  "part": {{"id": "p1", "messageID": "msg-1",
+                           "sessionID": "sess-multi", "type": "step-start"}}}}))
+print(json.dumps({{"type": "text", "timestamp": 0, "sessionID": "sess-multi", "part": part}}))
+print(json.dumps({{"type": "step_finish", "timestamp": 0, "sessionID": "sess-multi",
+                  "part": {{"id": "p3", "messageID": "msg-1",
+                           "sessionID": "sess-multi", "type": "step-finish",
+                           "reason": "stop"}}}}))
 """
     script_path.write_text(body, encoding="utf-8")
     script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
@@ -475,7 +484,7 @@ async def test_guild_watch_admission_debounce_and_delivery_flow(tmp_path, monkey
     msg = FakeMessage(
         message_id=8888,
         channel=thread_channel,
-        author=FakeAuthor(1234, name="user2"),
+        author=FakeAuthor(1234, name="bob"),
         content="<@99> how does this work in repo1?",
         mentions=[FakeMention(99)],
     )

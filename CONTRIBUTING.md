@@ -27,6 +27,17 @@ uv pip install -e . --force-reinstall --no-deps
 
 - **Read-only credentials.** Git remotes are read-scoped; never add write/push
   paths.
+- **Final-only output.** Only the final completed OpenCode assistant message is
+  deliverable. Intermediate narration, reasoning, and partial assistant steps
+  never reach the outbox or Discord, and reply truncation preserves the
+  provenance footer.
+- **Read-only merge-request audits.** MR/PR references resolve only against
+  configured watched repositories. Controller-side MR fetching is read-only and
+  limited to configured repositories; temporary base/head snapshots are never
+  persisted. Model permissions remain read-only file inspection with no Git,
+  network, or shell access. Review provenance carries exact base/head SHAs,
+  and unsupported, ambiguous, or unresolved references fail honestly instead of
+  auditing the current checkout.
 - **Native fail-closed agent.** OpenCode receives an inline `agent.oi` config;
   only repository-scoped `read`, `glob`, `grep`, `list`, and `lsp` are allowed.
   Editing, shell, web, MCP, skills, tasks, questions, external directories, and

@@ -23,7 +23,23 @@ build-backend = "hatchling.build"
 packages = ["src/oi_agent"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[tool.ruff]
+# Deterministic local gate: `uv run ruff check .` must pass.
+# 120 matches the codebase's real working width; the embedded prompt
+# template in opencode/prompt.py is content, not code (see per-file-ignores).
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Embedded prompt/schema template prose is model-facing content: line breaks
+# inside the template strings would change the prompt text (behavior, not style).
+"src/oi_agent/opencode/prompt.py" = ["E501"]
+"src/oi_agent/reflection/engine.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

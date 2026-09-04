@@ -1,120 +1,79 @@
-"""TOML configuration model and init/run helpers.
-
-Configuration supports any number of watch targets; each `[[watch]]` entry
-binds one Discord channel to one repository plus its own rules.
-"""
+"""Validated TOML configuration for the OpenCode-backed daemon."""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "oi" / "config.toml"
-DEFAULT_SECRETS_PATH = Path.home() / ".config" / "oi" / ".env"
-DISCORD_MAX_MESSAGE_CHARS = 2_000
+DEFAULT_SECRETS_PATH = Path.home() / ".config" / "oi" / "secrets.env"
+DEFAULT_PERSONALITY = "Talk like a smart teammate in chat, not a report generator."
 REPLY_DELIVERY_MODES = ("chunked", "single_message")
-
-DEFAULT_PERSONALITY = (
-    "A sharp, witty senior engineer. Dry humor, opinionated, direct. Call out "
-    "bad ideas instead of nodding along — but wit never replaces evidence. Talk "
-    "like a smart teammate in chat, not a report generator."
-)
-
-def load_secrets(path: Path = DEFAULT_SECRETS_PATH) -> None:
-    """Load KEY=VALUE pairs into os.environ without overriding existing vars.
-
-    Called by commands that talk to Discord/LLMs so users only paste secrets
-    once during `oi init`.
-
-    Args:
-        path: Secrets file location.
-    """
-    import os
-
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
-
-
-@dataclass
-class LLMConfig:
-    """One LLM endpoint used for the agent or fallback response stage.
-
-    Attributes:
-        base_url: Provider root, e.g. https://llm.example/v1 or https://api.z.ai.
-        model: Model identifier to request.
-        api_key_env: Env var name holding the key (never the key itself).
-        api_style: Wire protocol, ``openai`` or ``anthropic``.
-        disable_thinking: When True, ask reasoning models to skip the hidden
-            reasoning pass (vLLM/Qwen ``chat_template_kwargs.enable_thinking``)
-            so the answer lands in ``content`` instead of the reasoning field.
-    """
-
-    base_url: str
-    model: str
-    api_key_env: str = "OI_LLM_API_KEY"
-    api_style: str = "openai"
-    disable_thinking: bool = False
+ENVIRONMENT_MODES = ("workstation", "server")
+DISCORD_MAX_MESSAGE_CHARS = 2_000
+LEGACY_KEYS = {"agent", "llm", "api_key", "base_url", "search_aliases", "provider", "model"}
 
 
 @dataclass
 class WatchTarget:
-    """One watched Discord channel bound to one repository.
+    """One monitored Discord scope mapped to one or more local Git repositories."""
 
-    Attributes:
-        channel_id: Discord channel id to watch.
-        repo_path: Local watched clone this channel's questions audit (OI
-            runs git pull and writes .oi/ there; see README safety model).
-        bot_user_id: Bot application user id considered 'mentioned' in tags.
-        post_hourly_cap: Max autonomous replies per trailing hour.
-        search_stopwords: Extra domain words excluded from evidence search,
-            merged over the built-in neutral filler-word list.
-        search_aliases: Per-domain term expansion for repo search, e.g.
-            {"kpi": ["metric"]} — keeps domain vocabulary in config
-            instead of hardcoding one deployment's language into the pipeline.
-        preferred_tokens: Path substrings that rank evidence files higher.
-        max_tool_iterations: Per-watch agentic tool-loop depth override;
-            ``None`` inherits the global :attr:`Config.max_tool_iterations`.
-    """
-
-    channel_id: int
-    repo_path: str
+    channel_id: int = 0
+    repo_path: str = ""
     bot_user_id: int = 0
     post_hourly_cap: int = 3
-    search_aliases: dict[str, list[str]] = field(default_factory=dict)
-    preferred_tokens: list[str] = field(default_factory=list)
-    search_stopwords: list[str] = field(default_factory=list)
-    max_tool_iterations: int | None = None
+    guild_id: int = 0
+    repos: list[str] = field(default_factory=list)
+    ignored_channels: list[int] = field(default_factory=list)
+    allowed_channels: list[int] = field(default_factory=list)
+
+    @property
+    def repo_paths(self) -> list[str]:
+        """Return all watched repository paths in canonical order."""
+        if self.repos:
+            return list(self.repos)
+        if self.repo_path:
+            return [self.repo_path]
+        return []
+
+    @property
+    def primary_repo(self) -> str:
+        """Return the primary repository directory for OpenCode (--dir)."""
+        paths = self.repo_paths
+        return paths[0] if paths else self.repo_path
+
+    @property
+    def is_guild_watch(self) -> bool:
+        """Return True if this target watches an entire Discord server (guild)."""
+        return self.guild_id > 0 and self.channel_id == 0
+
+    def matches_channel(self, channel_id: int, guild_id: int | None = None) -> bool:
+        """Return True if this watch target applies to the given channel / guild."""
+        if not self.is_guild_watch:
+            return self.channel_id == channel_id
+
+        if guild_id is not None and guild_id != self.guild_id:
+            return False
+
+        if self.ignored_channels and channel_id in self.ignored_channels:
+            return False
+
+        if self.allowed_channels and channel_id not in self.allowed_channels:
+            return False
+
+        return True
 
 
 @dataclass
 class Config:
-    """Full daemon configuration.
+    """Full OpenCode-only daemon configuration.
 
-    Attributes:
-        discord_token_env: Env var holding the bot token.
-        db_path: State database path.
-        personality: User-selected response tone; safety/evidence rules remain
-            authoritative.
-        max_reply_chars: Total logical answer cap before delivery-mode handling.
-        reply_delivery: Discord delivery policy: ``chunked`` preserves the
-            compatibility behavior; ``single_message`` requires one message.
-        max_response_tokens: LLM output-token budget for a repo-audit answer.
-            Reasoning models spend part of this on hidden reasoning, so keep it
-            comfortably above the visible answer length.
-        max_tool_iterations: Global cap on agentic tool-loop rounds per audit
-            (each assistant turn requesting tool calls is one round).
-        fallback: Small-model endpoint used only after main-model failure.
-        agent: Main-model endpoint config.
-        watches: All watch targets.
+    OI enforces Discord safety rails, rate limits, burst coalescing, and
+    process isolation, while OpenCode handles model execution.
     """
 
     discord_token_env: str = "OI_DISCORD_TOKEN"
@@ -122,333 +81,357 @@ class Config:
     personality: str = DEFAULT_PERSONALITY
     max_reply_chars: int = 2_000
     reply_delivery: str = "chunked"
-    max_response_tokens: int = 4_000
-    fallback: LLMConfig = field(
-        default_factory=lambda: LLMConfig(
-            base_url="", model="", api_key_env="OI_FALLBACK_API_KEY"
-        )
-    )
-    agent: LLMConfig = field(
-        default_factory=lambda: LLMConfig(
-            base_url="", model="", api_key_env="OI_AGENT_API_KEY"
-        )
-    )
-    max_tool_iterations: int = 4
+    opencode_binary: str = "opencode"
+    opencode_model: str = "openai/gpt-4o-mini"
+    opencode_steps: int = 30
+    opencode_timeout_seconds: int = 900
+    environment_mode: str = "workstation"
     watches: list[WatchTarget] = field(default_factory=list)
 
-    def target_for_channel(self, channel_id: int) -> WatchTarget | None:
-        """Resolve the watch target a message belongs to (incl. threads).
+    @property
+    def resolved_environment_mode(self) -> str:
+        """Resolve effective environment mode: strictly 'workstation' or 'server'."""
+        if self.environment_mode in ("workstation", "server"):
+            return self.environment_mode
+        raise ValueError(
+            f"Invalid environment_mode: {self.environment_mode!r}. "
+            "Legacy 'auto' mode is deprecated. Run: oi config set environment_mode workstation|server"
+        )
+    def target_for_channel(self, channel_id: int, guild_id: int | None = None) -> WatchTarget | None:
+        """Resolve a watch target by channel ID and optional guild ID.
 
-        Args:
-            channel_id: The channel or thread id a message arrived in.
-
-        Returns:
-            Matching WatchTarget or None when the channel is not watched.
+        Direct channel-specific targets take precedence over guild-wide targets.
         """
-        for t in self.watches:
-            if t.channel_id == channel_id:
-                return t
+        # 1. Exact channel match
+        for target in self.watches:
+            if not target.is_guild_watch and target.matches_channel(channel_id, guild_id):
+                return target
+        # 2. Fallback to guild-wide targets
+        for target in self.watches:
+            if target.is_guild_watch and target.matches_channel(channel_id, guild_id):
+                return target
         return None
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
-    """Load and validate configuration from a TOML file.
+def _require_string(container: dict, key: str, default: str) -> str:
+    """Read a TOML string, rejecting implicit type coercion."""
+    if key not in container:
+        return default
+    value = container[key]
+    if not isinstance(value, str):
+        raise ValueError(f"'{key}' must be a string, got {type(value).__name__}")
+    return value
+
+
+def _require_int(container: dict, key: str, default: int) -> int:
+    """Read a TOML integer, rejecting floats, booleans, and strings."""
+    if key not in container:
+        return default
+    value = container[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"'{key}' must be an integer, got {type(value).__name__}")
+    return value
+
+
+def _require_string_list(container: dict, key: str) -> list[str]:
+    """Read a TOML list of strings, rejecting non-list and non-string items."""
+    if key not in container:
+        return []
+    value = container[key]
+    if not isinstance(value, list):
+        raise ValueError(f"'{key}' must be an array of strings, got {type(value).__name__}")
+    res: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"items in '{key}' must be non-empty strings, got {item!r}")
+        res.append(item)
+    return res
+
+
+def _require_int_list(container: dict, key: str) -> list[int]:
+    """Read a TOML list of integers, rejecting non-list and non-integer items."""
+    if key not in container:
+        return []
+    value = container[key]
+    if not isinstance(value, list):
+        raise ValueError(f"'{key}' must be an array of integers, got {type(value).__name__}")
+    res: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"items in '{key}' must be integers, got {item!r}")
+        if item <= 0:
+            raise ValueError(f"channel IDs in '{key}' must be positive integers, got {item}")
+        res.append(item)
+    return res
+
+
+def load_config(
+    path: Path = DEFAULT_CONFIG_PATH,
+    *,
+    allow_legacy_environment_mode: bool = False,
+) -> Config:
+    """Load and validate an OpenCode-only TOML configuration.
 
     Args:
-        path: Config file location.
+        path: Path to the configuration file.
+        allow_legacy_environment_mode: Tolerate a legacy ``auto`` value so
+            ``oi config set environment_mode`` can repair it. The caller must
+            overwrite ``environment_mode`` with a valid value before saving;
+            the placeholder ``workstation`` is substituted so validation
+            passes and nothing legacy is ever persisted as-is.
 
     Returns:
-        Parsed Config object.
+        Validated Config dataclass instance.
 
     Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: On structurally invalid entries.
+        ValueError: On schema violations, legacy sections, or missing fields.
     """
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    if not path.is_file():
+        raise ValueError(f"config file does not exist: {path}")
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid TOML in {path}: {exc}") from exc
 
-    def _str(container: dict, key: str, default: str) -> str:
-        """Require a TOML string (or use the default); reject other types."""
-        if key not in container:
-            return default
-        v = container[key]
-        if not isinstance(v, str):
-            raise ValueError(f"'{key}' must be a string, got {type(v).__name__}")
-        return v
+    legacy_found: list[str] = [k for k in LEGACY_KEYS if k in raw]
+    watches_raw = raw.get("watch") or raw.get("watches")
+    if isinstance(watches_raw, list):
+        for watch in watches_raw:
+            if isinstance(watch, dict):
+                legacy_found.extend(
+                    [k for k in ("search_aliases", "tool_iterations", "tools", "manifest") if k in watch]
+                )
+    if legacy_found:
+        raise ValueError(
+            f"config contains legacy settings ({', '.join(sorted(set(legacy_found)))}): "
+            "OI now uses native OpenCode; please rerun `oi init` to create a clean config."
+        )
 
-    def _int(container: dict, key: str, default: int) -> int:
-        """Require a TOML integer; reject bool/str/float coercion."""
-        if key not in container:
-            return default
-        v = container[key]
-        # bool is a subclass of int — reject it explicitly.
-        if isinstance(v, bool) or not isinstance(v, int):
-            raise ValueError(f"'{key}' must be an integer, got {type(v).__name__}")
-        return v
+    if not watches_raw or not isinstance(watches_raw, list):
+        raise ValueError(f"config at {path} must contain at least one [[watch]] table")
 
-    def _bool(container: dict, key: str, default: bool) -> bool:
-        """Require a TOML boolean; reject string/int coercion."""
-        if key not in container:
-            return default
-        v = container[key]
-        if not isinstance(v, bool):
-            raise ValueError(f"'{key}' must be a boolean, got {type(v).__name__}")
-        return v
-
-    def _str_list(container: dict, key: str, default: list[str]) -> list[str]:
-        """Require a TOML array of strings; reject a bare string or non-strings.
-
-        Guards against silent coercion: a bare ``"bug"`` must not become
-        ``["b", "u", "g"]``, and ``[1]`` must not become ``["1"]``.
-        """
-        if key not in container:
-            return list(default)
-        v = container[key]
-        if not isinstance(v, list) or any(not isinstance(x, str) for x in v):
-            raise ValueError(f"'{key}' must be a list of strings")
-        return v
-
-    cfg = Config(
-        discord_token_env=_str(raw, "discord_token_env", "OI_DISCORD_TOKEN"),
-        db_path=_str(raw, "db_path", cfg_default_db()),
-        personality=_str(raw, "personality", DEFAULT_PERSONALITY),
-        max_reply_chars=_int(raw, "max_reply_chars", 2_000),
-        reply_delivery=_str(raw, "reply_delivery", "chunked"),
-        max_response_tokens=_int(raw, "max_response_tokens", 4_000),
-        max_tool_iterations=_int(raw, "max_tool_iterations", 4),
+    legacy_environment_mode = isinstance(raw.get("environment_mode"), str) and (
+        raw["environment_mode"].strip().casefold() == "auto"
     )
-    fallback_raw = raw.get("fallback", {})
-    for section, section_raw in (
-        ("fallback", fallback_raw), ("agent", raw.get("agent", {}))
-    ):
-        if section_raw:
-            s = section_raw
-            setattr(cfg, section, LLMConfig(
-                base_url=_str(s, "base_url", ""),
-                model=_str(s, "model", ""),
-                api_key_env=_str(
-                    s, "api_key_env",
-                    "OI_FALLBACK_API_KEY"
-                    if section == "fallback" else "OI_AGENT_API_KEY",
+    if legacy_environment_mode and not allow_legacy_environment_mode:
+        raise ValueError(
+            "Legacy environment_mode 'auto' is deprecated. "
+            "Run `oi config set environment_mode workstation` or `oi config set environment_mode server`."
+        )
+    cfg = Config(
+        discord_token_env=_require_string(raw, "discord_token_env", "OI_DISCORD_TOKEN"),
+        db_path=_require_string(raw, "db_path", cfg_default_db()),
+        personality=_require_string(raw, "personality", DEFAULT_PERSONALITY),
+        max_reply_chars=_require_int(raw, "max_reply_chars", 2_000),
+        reply_delivery=_require_string(raw, "reply_delivery", "chunked"),
+        opencode_binary=_require_string(raw, "opencode_binary", "opencode"),
+        opencode_model=_require_string(raw, "opencode_model", "openai/gpt-4o-mini"),
+        opencode_steps=_require_int(raw, "opencode_steps", 30),
+        opencode_timeout_seconds=_require_int(
+            raw, "opencode_timeout_seconds", 900
+        ),
+        environment_mode=(
+            "workstation" if legacy_environment_mode
+            else _require_string(raw, "environment_mode", "workstation")
+        ),
+    )
+    for watch in watches_raw:
+        if not isinstance(watch, dict):
+            raise ValueError("each watch entry must be a table")
+        has_channel = "channel_id" in watch
+        has_guild = "guild_id" in watch
+        if (has_channel and has_guild) or (not has_channel and not has_guild):
+            raise ValueError(
+                f"watch entry must specify exactly one of 'channel_id' or 'guild_id': {watch}"
+            )
+
+        has_repo = "repo_path" in watch or "repos" in watch
+        if not has_repo:
+            raise ValueError(f"watch entry missing 'repo_path' or 'repos': {watch}")
+
+        repos_list = _require_string_list(watch, "repos")
+        ignored_list = _require_int_list(watch, "ignored_channels") or _require_int_list(watch, "ignore_channel_ids")
+        allowed_list = _require_int_list(watch, "allowed_channels") or _require_int_list(watch, "allowed_channel_ids")
+
+        cfg.watches.append(
+            WatchTarget(
+                channel_id=_require_int(watch, "channel_id", 0) if has_channel else 0,
+                repo_path=(
+                    _require_string(watch, "repo_path", "") if "repo_path" in watch
+                    else (repos_list[0] if repos_list else "")
                 ),
-                api_style=_str(s, "api_style", "openai"),
-                disable_thinking=_bool(s, "disable_thinking", False),
-            ))
-    for w in raw.get("watch", []):
-        for req in ("channel_id", "repo_path"):
-            if req not in w:
-                raise ValueError(f"watch entry missing '{req}': {w}")
-        aliases_raw = w.get("search_aliases", {})
-        if not isinstance(aliases_raw, dict):
-            raise ValueError("search_aliases must be a table")
-        for term, expansions in aliases_raw.items():
-            if not isinstance(term, str) or not term.strip():
-                raise ValueError(
-                    "search_aliases keys must be non-empty strings")
-            if not isinstance(expansions, list) or any(
-                    not isinstance(value, str) or not value.strip()
-                    for value in expansions):
-                raise ValueError(f"search_aliases[{term!r}] must be a list "
-                                 "of non-empty strings")
-        cfg.watches.append(WatchTarget(
-            channel_id=_int(w, "channel_id", 0),
-            repo_path=_str(w, "repo_path", ""),
-            bot_user_id=_int(w, "bot_user_id", 0),
-            post_hourly_cap=_int(w, "post_hourly_cap", 3),
-            search_aliases={term: list(expansions)
-                            for term, expansions in aliases_raw.items()},
-            preferred_tokens=_str_list(w, "preferred_tokens", []),
-            search_stopwords=_str_list(w, "search_stopwords", []),
-            # Absent key -> None -> inherits Config.max_tool_iterations.
-            max_tool_iterations=_int(w, "max_tool_iterations", None),
-        ))
-    # Manual edits bypass save_config(), so the loader is the second gate:
-    # invalid on-disk config must never reach the daemon.
+                bot_user_id=_require_int(watch, "bot_user_id", 0),
+                post_hourly_cap=_require_int(watch, "post_hourly_cap", 3),
+                guild_id=_require_int(watch, "guild_id", 0) if has_guild else 0,
+                repos=repos_list,
+                ignored_channels=ignored_list,
+                allowed_channels=allowed_list,
+            )
+        )
     validate_config(cfg)
     return cfg
 
 
+def _resolve_binary(binary: str) -> str | None:
+    """Resolve an executable command or absolute/relative binary path."""
+    if not binary.strip():
+        return None
+    expanded = Path(binary).expanduser()
+    if expanded.is_file() and os.access(expanded, os.X_OK):
+        return str(expanded.resolve())
+    return shutil.which(binary)
 
 
 def validate_config(cfg: Config) -> None:
-    """Raise ValueError when any configuration invariant is broken.
-
-    Single source of truth for semantic validation: save_config() refuses to
-    write anything that fails here, so every write path (init wizard,
-    ``oi config set``, ``config watch-add``, programmatic saves) is covered
-    and a rejected write leaves the previous file byte-for-byte intact.
+    """Raise ``ValueError`` when an OpenCode config invariant is broken.
 
     Args:
-        cfg: Configuration to check.
-
-    Raises:
-        ValueError: With a precise message naming the first broken field.
+        cfg: Configuration to validate before persistence or runtime use.
     """
-    for name in ("discord_token_env", "db_path"):
-        if not str(getattr(cfg, name, "")).strip():
+    for name in ("discord_token_env", "db_path", "opencode_binary", "opencode_model"):
+        value = getattr(cfg, name, "")
+        if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{name} must be a non-empty string")
+    provider, separator, model = cfg.opencode_model.partition("/")
+    if not separator or not provider.strip() or not model.strip():
+        raise ValueError(
+            "opencode_model must use the exact provider/model format "
+            f"(got {cfg.opencode_model!r})"
+        )
+    if _resolve_binary(cfg.opencode_binary) is None:
+        raise ValueError(f"opencode_binary is not executable: {cfg.opencode_binary!r}")
     if cfg.reply_delivery not in REPLY_DELIVERY_MODES:
-        raise ValueError("reply_delivery must be one of "
-                         f"{REPLY_DELIVERY_MODES!r} "
-                         f"(got {cfg.reply_delivery!r})")
-    for name, minimum in (("max_reply_chars", 200),
-                          ("max_response_tokens", 256)):
+        raise ValueError(
+            f"reply_delivery must be one of {REPLY_DELIVERY_MODES!r} "
+            f"(got {cfg.reply_delivery!r})"
+        )
+    if cfg.environment_mode not in ENVIRONMENT_MODES:
+        raise ValueError(
+            f"environment_mode must be one of {ENVIRONMENT_MODES!r} "
+            f"(got {cfg.environment_mode!r})"
+        )
+    for name, minimum in (("max_reply_chars", 200), ("opencode_steps", 1),
+                          ("opencode_timeout_seconds", 1)):
         value = getattr(cfg, name)
-        # bool is an int subclass but never a legitimate limit.
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer (got {value!r})")
-        if value < minimum:
-            raise ValueError(f"{name} must be >= {minimum} (got {value})")
-    if cfg.reply_delivery == "single_message" \
-            and cfg.max_reply_chars > DISCORD_MAX_MESSAGE_CHARS:
+        maximum = {"opencode_steps": 50, "opencode_timeout_seconds": 86_400}.get(name)
+        if value < minimum or (maximum is not None and value > maximum):
+            bound = f"[{minimum}, {maximum}]" if maximum else f">= {minimum}"
+            raise ValueError(f"{name} must be in {bound} (got {value})")
+    if cfg.reply_delivery == "single_message" and cfg.max_reply_chars > DISCORD_MAX_MESSAGE_CHARS:
         raise ValueError(
             "max_reply_chars must be <= 2000 when "
-            "reply_delivery='single_message' "
-            f"(got {cfg.max_reply_chars})")
-    value = cfg.max_tool_iterations
-    # bool is an int subclass but never a legitimate loop depth.
-    if isinstance(value, bool) or not isinstance(value, int) \
-            or not 1 <= value <= 50:
-        raise ValueError("max_tool_iterations must be an integer in "
-                         f"[1, 50] (got {value!r})")
-    for section in ("fallback", "agent"):
-        llm = getattr(cfg, section)
-        if llm.api_style not in ("openai", "anthropic"):
-            raise ValueError(f"{section}.api_style must be "
-                             f"'openai' or 'anthropic' (got {llm.api_style!r})")
-        for attr in ("base_url", "model", "api_key_env"):
-            if not isinstance(getattr(llm, attr), str):
-                raise ValueError(f"{section}.{attr} must be a string")
+            f"reply_delivery='single_message' (got {cfg.max_reply_chars})"
+        )
     if not cfg.watches:
         raise ValueError("at least one watch target is required")
     seen_channels: set[int] = set()
-    for t in cfg.watches:
-        if isinstance(t.channel_id, bool) or not isinstance(t.channel_id, int) \
-                or t.channel_id <= 0:
-            raise ValueError("watch channel_id must be a positive integer "
-                             f"(got {t.channel_id!r})")
-        if t.channel_id in seen_channels:
-            raise ValueError(f"duplicate watch channel_id {t.channel_id}")
-        if isinstance(t.post_hourly_cap, bool) \
-                or not isinstance(t.post_hourly_cap, int) \
-                or t.post_hourly_cap < 1:
-            raise ValueError("post_hourly_cap must be an integer >= 1 "
-                             f"(got {t.post_hourly_cap!r})")
-        if t.max_tool_iterations is not None:
-            v = t.max_tool_iterations
-            if isinstance(v, bool) or not isinstance(v, int) \
-                    or not 1 <= v <= 50:
-                raise ValueError(
-                    "watch max_tool_iterations must be an integer in "
-                    f"[1, 50] (got {v!r})")
-        if isinstance(t.bot_user_id, bool) \
-                or not isinstance(t.bot_user_id, int) or t.bot_user_id < 0:
-            raise ValueError("bot_user_id must be a non-negative integer "
-                             f"(got {t.bot_user_id!r})")
-        for term, expansions in t.search_aliases.items():
-            if not isinstance(term, str) or not term.strip():
-                raise ValueError(f"search_aliases keys must be non-empty "
-                                 f"strings (got {term!r})")
-            if not isinstance(expansions, list) or any(
-                    not isinstance(v, str) or not v.strip()
-                    for v in expansions):
-                raise ValueError(f"search_aliases[{term!r}] must be a list "
-                                 f"of non-empty strings")
+    seen_guilds: set[int] = set()
+    for target in cfg.watches:
+        if isinstance(target.channel_id, bool) or not isinstance(target.channel_id, int) or target.channel_id < 0:
+            raise ValueError(f"channel_id must be a non-negative integer (got {target.channel_id!r})")
+        if isinstance(target.guild_id, bool) or not isinstance(target.guild_id, int) or target.guild_id < 0:
+            raise ValueError(f"guild_id must be a non-negative integer (got {target.guild_id!r})")
+
+        if target.channel_id > 0 and target.guild_id > 0:
+            raise ValueError(f"watch entry cannot specify both channel_id and guild_id: {target}")
+        if target.channel_id <= 0 and target.guild_id <= 0:
+            raise ValueError(f"watch entry must specify exactly one positive channel_id or guild_id: {target}")
+
+        if target.channel_id > 0:
+            if target.channel_id in seen_channels:
+                raise ValueError(f"duplicate watch channel_id {target.channel_id}")
+            seen_channels.add(target.channel_id)
+        if target.is_guild_watch:
+            if target.guild_id in seen_guilds:
+                raise ValueError(f"duplicate watch guild_id {target.guild_id}")
+            seen_guilds.add(target.guild_id)
+
+        if not isinstance(target.repo_path, str):
+            raise ValueError(f"repo_path must be a string (got {target.repo_path!r})")
+
+        if not isinstance(target.repos, list):
+            raise ValueError(f"repos must be a list of strings (got {target.repos!r})")
+        for r in target.repos:
+            if not isinstance(r, str) or not r.strip():
+                raise ValueError(f"repos item must be a non-empty string (got {r!r})")
+
+        paths = target.repo_paths
+        if not paths:
+            raise ValueError("watch entry must define at least one non-empty repo_path or repos item")
+        for p in paths:
+            if not isinstance(p, str) or not p.strip():
+                raise ValueError(f"watch repo path must be a non-empty string (got {p!r})")
+
+        if not isinstance(target.ignored_channels, list):
+            raise ValueError(f"ignored_channels must be a list of positive integers (got {target.ignored_channels!r})")
+        for item in target.ignored_channels:
+            if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+                raise ValueError(f"ignored_channels item must be a positive integer (got {item!r})")
+
+        if not isinstance(target.allowed_channels, list):
+            raise ValueError(f"allowed_channels must be a list of positive integers (got {target.allowed_channels!r})")
+        for item in target.allowed_channels:
+            if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+                raise ValueError(f"allowed_channels item must be a positive integer (got {item!r})")
+
+        if (
+            isinstance(target.post_hourly_cap, bool) or not isinstance(target.post_hourly_cap, int)
+            or target.post_hourly_cap < 1
+        ):
+            raise ValueError(f"post_hourly_cap must be an integer >= 1 (got {target.post_hourly_cap!r})")
+        if isinstance(target.bot_user_id, bool) or not isinstance(target.bot_user_id, int) or target.bot_user_id < 0:
+            raise ValueError(f"bot_user_id must be a non-negative integer (got {target.bot_user_id!r})")
 
 
 def cfg_default_db() -> str:
-    """Return the default state db path as a string."""
+    """Return the default SQLite state path."""
     return "~/.local/state/oi/state.db"
 
 
-def effective_max_tool_iterations(cfg: Config, target: WatchTarget) -> int:
-    """Resolve the agentic tool-loop depth for one watch target.
-
-    Args:
-        cfg: Full configuration holding the global default.
-        target: Watch target whose optional per-watch override wins.
-
-    Returns:
-        The watch's max_tool_iterations when set, else the config default.
-    """
-    if target.max_tool_iterations is not None:
-        return target.max_tool_iterations
-    return cfg.max_tool_iterations
-
-
-
-
-def _toml_inline_table(mapping: dict[str, list[str]]) -> str:
-    """Render a string->list mapping as a valid TOML inline table.
-
-    json.dumps is not enough here: TOML separates key and value with ``=``,
-    not JSON's ``:``. Strings and lists inside stay json.dumps-quoted.
-
-    Args:
-        mapping: e.g. ``{"kpi": ["metric"]}``.
-
-    Returns:
-        Inline-table text such as ``{ "kpi" = ["metric"] }``.
-    """
-    items = ", ".join(
-        f"{json.dumps(k)} = {json.dumps(vs)}" for k, vs in mapping.items()
-    )
-    return "{ " + items + " }" if items else "{}"
-
-
 def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
-    """Validate and atomically write configuration to TOML.
-
-    Validation runs BEFORE any bytes are touched, so an invalid config can
-    never clobber a previously working one. The write lands in a temporary
-    sibling file that is os.replace()d into place — readers see either the
-    old or the new file, never a partial write.
+    """Validate and atomically write an OpenCode-only TOML config.
 
     Args:
-        cfg: Config to serialize.
-        path: Destination file; parent dirs are created.
-
-    Raises:
-        ValueError: From validate_config() when an invariant is broken.
+        cfg: Configuration to serialize.
+        path: Destination path.
     """
     validate_config(cfg)
     lines = [
-        f'discord_token_env = {json.dumps(cfg.discord_token_env)}',
-        f'db_path = {json.dumps(cfg.db_path)}',
-        f'personality = {json.dumps(cfg.personality)}',
+        f"discord_token_env = {json.dumps(cfg.discord_token_env)}",
+        f"db_path = {json.dumps(cfg.db_path)}",
+        f"personality = {json.dumps(cfg.personality)}",
         f"max_reply_chars = {cfg.max_reply_chars}",
         f"reply_delivery = {json.dumps(cfg.reply_delivery)}",
-        f"max_response_tokens = {cfg.max_response_tokens}",
-        f"max_tool_iterations = {cfg.max_tool_iterations}",
-        "",
-        "[fallback]",
-        f"base_url = {json.dumps(cfg.fallback.base_url)}",
-        f"model = {json.dumps(cfg.fallback.model)}",
-        f"api_key_env = {json.dumps(cfg.fallback.api_key_env)}",
-        f"api_style = {json.dumps(cfg.fallback.api_style)}",
-        f'disable_thinking = {str(cfg.fallback.disable_thinking).lower()}',
-        "",
-        "[agent]",
-        f"base_url = {json.dumps(cfg.agent.base_url)}",
-        f"model = {json.dumps(cfg.agent.model)}",
-        f"api_key_env = {json.dumps(cfg.agent.api_key_env)}",
-        f"api_style = {json.dumps(cfg.agent.api_style)}",
-        f'disable_thinking = {str(cfg.agent.disable_thinking).lower()}',
-        "",
+        f"opencode_binary = {json.dumps(cfg.opencode_binary)}",
+        f"opencode_model = {json.dumps(cfg.opencode_model)}",
+        f"opencode_steps = {cfg.opencode_steps}",
+        f"opencode_timeout_seconds = {cfg.opencode_timeout_seconds}",
+        f"environment_mode = {json.dumps(cfg.environment_mode)}",
     ]
-    for t in cfg.watches:
-        lines += [
-            "[[watch]]",
-            f"channel_id = {t.channel_id}",
-            f"repo_path = {json.dumps(t.repo_path)}",
-            f"bot_user_id = {t.bot_user_id}",
-            f"post_hourly_cap = {t.post_hourly_cap}",
-            *([f"max_tool_iterations = {t.max_tool_iterations}"]
-              if t.max_tool_iterations is not None else []),
-            f"search_aliases = {_toml_inline_table(t.search_aliases)}",
-            f"preferred_tokens = {json.dumps(t.preferred_tokens)}",
-            f"search_stopwords = {json.dumps(t.search_stopwords)}",
-            "",
-        ]
+    for target in cfg.watches:
+        lines.append("")
+        lines.append("[[watch]]")
+        if target.is_guild_watch:
+            lines.append(f"guild_id = {target.guild_id}")
+            if target.ignored_channels:
+                lines.append(f"ignored_channels = {target.ignored_channels}")
+            if target.allowed_channels:
+                lines.append(f"allowed_channels = {target.allowed_channels}")
+        else:
+            lines.append(f"channel_id = {target.channel_id}")
+
+        if len(target.repo_paths) > 1 or target.repos:
+            lines.append(f"repos = {json.dumps(target.repo_paths)}")
+        else:
+            lines.append(f"repo_path = {json.dumps(target.primary_repo)}")
+
+        if target.bot_user_id:
+            lines.append(f"bot_user_id = {target.bot_user_id}")
+        if target.post_hourly_cap != 3:
+            lines.append(f"post_hourly_cap = {target.post_hourly_cap}")
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text("\n".join(lines), encoding="utf-8")

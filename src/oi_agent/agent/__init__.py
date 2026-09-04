@@ -1,1 +1,1 @@
-"""Agent package: LLM clients, jailed tools, and response pipeline."""
+"""Shared response value objects for the OpenCode runtime."""

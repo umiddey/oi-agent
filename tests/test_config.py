@@ -1,386 +1,195 @@
-"""Tests for config load/save roundtrip and validation."""
+"""Tests for the OpenCode-only configuration contract."""
+
+import shutil
 
 import pytest
+from typer.testing import CliRunner
 
-from oi_agent.config import (
-    Config,
-    LLMConfig,
-    WatchTarget,
-    effective_max_tool_iterations,
-    load_config,
-    save_config,
-)
+from oi_agent.config import Config, WatchTarget, load_config, save_config
 
 
-def _write(path, text):
-    path.write_text(text, encoding="utf-8")
-    return path
+def _binary() -> str:
+    """Return a portable executable accepted by config validation."""
+    return shutil.which("true") or "/bin/true"
 
 
-def test_roundtrip(tmp_path):
-    cfg = Config()
+def _valid_config() -> Config:
+    """Build a valid isolated test configuration."""
+    cfg = Config(opencode_binary=_binary(), opencode_model="provider/model")
+    cfg.watches = [WatchTarget(channel_id=111, repo_path="/srv/repo")]
+    return cfg
+
+
+def test_roundtrip_is_opencode_only(tmp_path):
+    """New settings round-trip and contain no provider credentials."""
+    cfg = _valid_config()
     cfg.personality = 'Warm "expert"\nUse bullets.'
-    cfg.max_reply_chars = 2_000
-    cfg.max_response_tokens = 8_192
-    cfg.fallback = LLMConfig("http://a/v1", "m1", "K1")
-    cfg.agent = LLMConfig("http://b/v1", "m2", "K2", disable_thinking=True)
-    cfg.watches = [
-        WatchTarget(channel_id=111, repo_path="/srv/repo",
-                    bot_user_id=42, post_hourly_cap=5),
-        WatchTarget(channel_id=333, repo_path="/srv/other"),
-    ]
-    p = tmp_path / "config.toml"
-    save_config(cfg, p)
-    back = load_config(p)
-    assert back.max_reply_chars == 2_000
-    assert back.reply_delivery == "chunked"
-    assert back.max_response_tokens == 8_192
-    assert back.personality == 'Warm "expert"\nUse bullets.'
-    w = back.watches[0]
-    assert (w.channel_id, w.bot_user_id, w.post_hourly_cap) == (111, 42, 5)
-    assert back.agent.disable_thinking is True
-    assert back.fallback.disable_thinking is False
-    assert back.target_for_channel(333).repo_path == "/srv/other"
-    # Thread id lookup misses -> None handled by watcher via parent.
-    assert back.target_for_channel(999999) is None
-
-
-def test_watch_vocab_roundtrip(tmp_path):
-    """search_aliases/preferred_tokens/search_stopwords survive save/load."""
-    cfg = Config()
-    cfg.watches = [
-        WatchTarget(channel_id=1, repo_path="/srv/repo",
-                    search_aliases={"kpi": ["metric", "dashboard"]},
-                    preferred_tokens=["billing", "invoice"],
-                    search_stopwords=["scratch", "archive"]),
-    ]
-    p = tmp_path / "config.toml"
-    save_config(cfg, p)
-
-    back = load_config(p)
-
-    w = back.watches[0]
-    assert w.search_aliases == {"kpi": ["metric", "dashboard"]}
-    assert w.preferred_tokens == ["billing", "invoice"]
-    assert w.search_stopwords == ["scratch", "archive"]
-
-
-def test_watch_vocab_defaults_are_neutral(tmp_path):
-    """A watch entry without vocabulary keys gets empty (neutral) defaults."""
-    p = _write(tmp_path / "c.toml",
-               '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n')
-
-    cfg = load_config(p)
-
-    w = cfg.watches[0]
-    assert w.search_aliases == {}
-    assert w.preferred_tokens == []
-    assert w.search_stopwords == []
-
-
-def test_missing_watch_field_rejected(tmp_path):
-    p = _write(tmp_path / "c.toml", '[[watch]]\nchannel_id = 1\n')
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-def test_no_watches_rejected(tmp_path):
-    p = _write(tmp_path / "c.toml", "")
-    with pytest.raises(ValueError):
-        load_config(p)
-
-def test_save_rejects_config_without_watches(tmp_path):
-    """Every successfully saved config must be loadable by the same model."""
+    cfg.opencode_steps = 50
+    cfg.opencode_timeout_seconds = 1200
     path = tmp_path / "config.toml"
 
-    with pytest.raises(ValueError, match="watch"):
-        save_config(Config(), path)
-
-    assert not path.exists()
-
-
-@pytest.mark.parametrize("aliases", [
-    '{ foo = "bar" }',
-    '{ foo = [1, 2] }',
-])
-def test_malformed_search_alias_shapes_rejected(tmp_path, aliases):
-    """Alias expansions must be TOML arrays of strings before normalization."""
-    path = _write(
-        tmp_path / "aliases.toml",
-        "[[watch]]\n"
-        "channel_id = 1\n"
-        'repo_path = "/repo"\n'
-        f"search_aliases = {aliases}\n",
-    )
-
-    with pytest.raises(ValueError, match="search_aliases"):
-        load_config(path)
-
-
-def test_max_response_tokens_defaults_when_absent(tmp_path):
-    """A config without the key falls back to the 4000-token default."""
-    p = _write(tmp_path / "c.toml",
-               '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n')
-
-    cfg = load_config(p)
-
-    assert cfg.max_response_tokens == 4_000
-
-
-@pytest.mark.parametrize("bad_toml", [
-    "personality = [1]\n[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\n",
-    "[[watch]]\nchannel_id = 1\nrepo_path = 42\n",
-    "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\nbot_user_id = true\n",
-    "[agent]\ndisable_thinking = \"false\"\n[[watch]]\nchannel_id = 1\n"
-    "repo_path = \"/r\"\n",
-    # Collection types must not silently coerce: bare string -> not char list,
-    # and non-string list elements are rejected.
-    "[[watch]]\nchannel_id = 1\nrepo_path = \"/r\"\npreferred_tokens = [1]\n",
-])
-def test_malformed_toml_types_are_rejected(tmp_path, bad_toml):
-    """Raw TOML types must be validated, not silently coerced."""
-    p = _write(tmp_path / "c.toml", bad_toml)
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-def test_save_survives_quotes_and_apostrophes(tmp_path):
-    """Regression: hand-rolled TOML quoting once bricked configs.
-
-    A quote in base_url or an apostrophe in a keyword must round-trip through
-    save_config/load_config without producing unloadable TOML.
-    """
-    cfg = Config()
-    cfg.agent = LLMConfig(base_url='https://x/"bad', model='m',
-                          api_key_env="K")
-    cfg.watches = [
-        WatchTarget(channel_id=1, repo_path='/srv/o"brien'),
-    ]
-    p = tmp_path / "config.toml"
-
-    save_config(cfg, p)
-
-    back = load_config(p)  # must not raise TOMLDecodeError
-    assert back.agent.base_url == 'https://x/"bad'
-    assert back.watches[0].repo_path == '/srv/o"brien'
-
-
-def test_save_creates_missing_parent_dirs(tmp_path):
-    """First-run regression: `oi init` on a fresh machine has no ~/.config/oi.
-
-    The atomic-write change briefly dropped parent creation, so the tmp
-    sibling write raised FileNotFoundError. The destination directory must
-    be created before the temporary file is written.
-    """
-    cfg = Config()
-    cfg.watches = [WatchTarget(channel_id=1, repo_path="/srv/repo")]
-    nested = tmp_path / "missing" / "oi" / "config.toml"
-
-    save_config(cfg, nested)  # must not raise
-
-    assert load_config(nested).watches[0].channel_id == 1
-    # No temp litter left behind.
-    assert not (tmp_path / "missing" / "oi" / "config.toml.tmp").exists()
-
-
-def test_invalid_on_disk_config_rejected_on_load(tmp_path):
-    """Manual edits bypass save_config; the loader must still gate them.
-
-    Reproduces the review's exact TOML: tiny limits, bogus wire style, and a
-    negative post cap (which would silently block every reservation).
-    """
-    p = _write(
-        tmp_path / "bad.toml",
-        'max_reply_chars = 1\n'
-        'max_response_tokens = 1\n\n'
-        '[agent]\n'
-        'base_url = "http://x/v1"\n'
-        'model = "m"\n'
-        'api_style = "bogus"\n\n'
-        '[[watch]]\n'
-        'channel_id = 1\n'
-        'repo_path = "/repo"\n'
-        'post_hourly_cap = -5\n',
-    )
-
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-def test_reply_cap_at_discord_limit_is_valid(tmp_path):
-    """The strict delivery mode accepts Discord's one-message maximum."""
-    cfg = Config(max_reply_chars=2_000, reply_delivery="single_message")
-    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
-    path = tmp_path / "reply-cap.toml"
-
     save_config(cfg, path)
-
     back = load_config(path)
-    assert back.max_reply_chars == 2_000
-    assert back.reply_delivery == "single_message"
+
+    assert back.opencode_model == "provider/model"
+    assert back.opencode_steps == 50
+    assert back.opencode_timeout_seconds == 1200
+    assert back.personality == cfg.personality
+    assert back.watches[0].channel_id == 111
+    assert "api_key" not in path.read_text()
+    assert "base_url" not in path.read_text()
 
 
-def test_single_message_rejects_cap_above_discord_limit(tmp_path):
-    """Strict one-message delivery cannot be paired with a larger cap."""
-    cfg = Config(max_reply_chars=2_001, reply_delivery="single_message")
-    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
-    path = tmp_path / "reply-cap.toml"
-
-    with pytest.raises(ValueError, match="single_message"):
-        save_config(cfg, path)
-
-    assert not path.exists()
-
-
-def test_invalid_reply_delivery_rejected(tmp_path):
-    """Only the documented delivery modes are accepted."""
-    cfg = Config(reply_delivery="bogus")
-    cfg.watches = [WatchTarget(channel_id=1, repo_path="/repo")]
-    with pytest.raises(ValueError, match="reply_delivery"):
-        save_config(cfg, tmp_path / "reply-mode.toml")
-
-    path = _write(
-        tmp_path / "manual-reply-mode.toml",
-        'reply_delivery = "bogus"\n'
-        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n',
+def test_legacy_harness_keys_fail_with_migration_message(tmp_path):
+    """Old provider/tool-loop settings fail instead of being ignored."""
+    path = tmp_path / "legacy.toml"
+    path.write_text(
+        '[agent]\nbase_url = "https://example.invalid"\n'
+        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n'
+        'search_aliases = { bug = ["defect"] }\n',
+        encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="reply_delivery"):
+
+    with pytest.raises(ValueError, match="rerun `oi init`"):
+        load_config(path)
+def test_missing_watch_and_missing_required_field_rejected(tmp_path):
+    """A daemon config must contain at least one complete watch target."""
+    missing = tmp_path / "missing.toml"
+    missing.write_text(
+        "[[watch]]\nchannel_id = 1\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="repo_path"):
+        load_config(missing)
+
+    empty = tmp_path / "empty.toml"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="watch"):
+        load_config(empty)
+
+
+def test_invalid_model_binary_and_limits_rejected(tmp_path):
+    """Provider/model shape, executable, steps, and timeout are bounded."""
+    cfg = _valid_config()
+    cfg.opencode_model = "bare-model"
+    with pytest.raises(ValueError, match="provider/model"):
+        save_config(cfg, tmp_path / "bad-model.toml")
+
+    cfg = _valid_config()
+    cfg.opencode_binary = str(tmp_path / "missing-opencode")
+    with pytest.raises(ValueError, match="not executable"):
+        save_config(cfg, tmp_path / "bad-binary.toml")
+
+    for field, value in (("opencode_steps", 51),
+                         ("opencode_timeout_seconds", 86_401)):
+        cfg = _valid_config()
+        setattr(cfg, field, value)
+        with pytest.raises(ValueError, match=field):
+            save_config(cfg, tmp_path / f"bad-{field}.toml")
+
+
+def test_atomic_save_preserves_previous_bytes_on_validation_failure(tmp_path):
+    """Validation happens before the atomic replacement and never clobbers."""
+    path = tmp_path / "config.toml"
+    save_config(_valid_config(), path)
+    before = path.read_bytes()
+
+    invalid = _valid_config()
+    invalid.max_reply_chars = 1
+    with pytest.raises(ValueError):
+        save_config(invalid, path)
+
+    assert path.read_bytes() == before
+    assert not (tmp_path / "config.toml.tmp").exists()
+
+
+def test_single_message_limit_and_target_resolution(tmp_path):
+    """Retained Discord delivery constraints still validate in the new schema."""
+    cfg = _valid_config()
+    cfg.reply_delivery = "single_message"
+    cfg.max_reply_chars = 2000
+    path = tmp_path / "config.toml"
+    save_config(cfg, path)
+    assert load_config(path).target_for_channel(111).repo_path == "/srv/repo"
+
+    cfg.max_reply_chars = 2001
+    with pytest.raises(ValueError, match="single_message"):
+        save_config(cfg, tmp_path / "too-large.toml")
+
+
+def test_environment_mode_roundtrip_for_both_values(tmp_path):
+    """workstation and server both survive a validated TOML round-trip."""
+    for mode in ("workstation", "server"):
+        cfg = _valid_config()
+        cfg.environment_mode = mode
+        path = tmp_path / f"config-{mode}.toml"
+        save_config(cfg, path)
+        assert load_config(path).environment_mode == mode
+
+
+def test_environment_mode_invalid_value_rejected(tmp_path):
+    """Only workstation | server are valid; anything else fails validation."""
+    cfg = _valid_config()
+    cfg.environment_mode = "hybrid"
+    with pytest.raises(ValueError, match="environment_mode"):
+        save_config(cfg, tmp_path / "bad-mode.toml")
+
+
+def test_environment_mode_legacy_auto_variants_get_migration_hint(tmp_path):
+    """'auto' and case/whitespace variants fail with the exact repair command."""
+    for raw_value in ("auto", "AUTO", " auto ", "Auto"):
+        path = tmp_path / "legacy.toml"
+        path.write_text(
+            f'environment_mode = "{raw_value}"\n'
+            '[[watch]]\nchannel_id = 111\nrepo_path = "/srv/repo"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="oi config set environment_mode"):
+            load_config(path)
+
+
+def test_config_set_environment_mode_cli_roundtrip(tmp_path):
+    """oi config set accepts environment_mode; show displays it; invalid rejected."""
+    from oi_agent.cli import app
+
+    runner = CliRunner()
+    path = tmp_path / "config.toml"
+    save_config(_valid_config(), path)
+
+    result = runner.invoke(
+        app, ["config", "set", "environment_mode", "server", "--config", str(path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert load_config(path).environment_mode == "server"
+
+    shown = runner.invoke(app, ["config", "show", "--config", str(path)])
+    assert shown.exit_code == 0, shown.output
+    assert "environment_mode = server" in shown.output
+
+    bad = runner.invoke(
+        app, ["config", "set", "environment_mode", "hybrid", "--config", str(path)]
+    )
+    assert bad.exit_code == 1
+    assert load_config(path).environment_mode == "server"
+
+
+def test_config_set_environment_mode_repairs_legacy_auto(tmp_path):
+    """The documented repair command works on a legacy 'auto' config."""
+    from oi_agent.cli import app
+
+    runner = CliRunner()
+    path = tmp_path / "config.toml"
+    save_config(_valid_config(), path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'environment_mode = "workstation"', 'environment_mode = "auto"'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="oi config set environment_mode"):
         load_config(path)
 
-
-def test_negative_bot_user_id_and_bad_vocab_rejected(tmp_path):
-    p = _write(
-        tmp_path / "bad2.toml",
-        '[[watch]]\n'
-        'channel_id = 1\n'
-        'repo_path = "/repo"\n'
-        'bot_user_id = -7\n'
-        'search_stopwords = ["ok", ""]\n',
+    result = runner.invoke(
+        app, ["config", "set", "environment_mode", "server", "--config", str(path)]
     )
-
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-def test_max_tool_iterations_roundtrip(tmp_path):
-    """Root knob always saved; watch override saved only when set."""
-    cfg = Config()
-    cfg.max_tool_iterations = 9
-    cfg.watches = [
-        WatchTarget(channel_id=1, repo_path="/srv/a", max_tool_iterations=12),
-        WatchTarget(channel_id=2, repo_path="/srv/b"),
-    ]
-    p = tmp_path / "config.toml"
-    save_config(cfg, p)
-
-    text = p.read_text()
-    back = load_config(p)
-
-    assert back.max_tool_iterations == 9
-    assert back.watches[0].max_tool_iterations == 12
-    assert back.watches[1].max_tool_iterations is None
-    # Root line + exactly one watch line (the None watch omits the key).
-    assert text.count("max_tool_iterations") == 2
-
-
-def test_max_tool_iterations_defaults_when_absent(tmp_path):
-    """A config without the keys falls back to root 4 / inherit None."""
-    p = _write(
-        tmp_path / "c.toml",
-        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n',
-    )
-
-    cfg = load_config(p)
-
-    assert cfg.max_tool_iterations == 4
-    assert cfg.watches[0].max_tool_iterations is None
-    assert effective_max_tool_iterations(cfg, cfg.watches[0]) == 4
-
-
-@pytest.mark.parametrize("bad_toml", [
-    'max_tool_iterations = 0\n',
-    'max_tool_iterations = -1\n',
-    'max_tool_iterations = 51\n',
-    'max_tool_iterations = "5"\n',
-    'max_tool_iterations = true\n',
-])
-def test_bad_root_max_tool_iterations_rejected_on_load(tmp_path, bad_toml):
-    """The loader gates out-of-range and non-int root values."""
-    p = _write(
-        tmp_path / "c.toml",
-        bad_toml + '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n',
-    )
-
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-@pytest.mark.parametrize("good_value", [1, 50])
-def test_max_tool_iterations_boundary_accepted(tmp_path, good_value):
-    """Both ends of the [1, 50] range load without error."""
-    p = _write(
-        tmp_path / "c.toml",
-        f'max_tool_iterations = {good_value}\n'
-        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n',
-    )
-
-    cfg = load_config(p)
-
-    assert cfg.max_tool_iterations == good_value
-
-
-@pytest.mark.parametrize("bad_value", [0, -3, 51, "5", True, 2.5])
-def test_bad_root_max_tool_iterations_rejected_on_save(tmp_path, bad_value):
-    """save_config refuses invalid root values and writes nothing."""
-    cfg = Config()
-    cfg.max_tool_iterations = bad_value
-    cfg.watches = [WatchTarget(channel_id=1, repo_path="/srv/a")]
-    p = tmp_path / "config.toml"
-
-    with pytest.raises(ValueError):
-        save_config(cfg, p)
-    assert not p.exists()
-
-
-@pytest.mark.parametrize("bad_toml", [
-    'max_tool_iterations = 0\n',
-    'max_tool_iterations = -2\n',
-    'max_tool_iterations = 51\n',
-    'max_tool_iterations = "many"\n',
-    'max_tool_iterations = false\n',
-])
-def test_bad_watch_max_tool_iterations_rejected_on_load(tmp_path, bad_toml):
-    """A SET watch value must be an int within [1, 50]."""
-    p = _write(
-        tmp_path / "c.toml",
-        '[[watch]]\nchannel_id = 1\nrepo_path = "/repo"\n' + bad_toml,
-    )
-
-    with pytest.raises(ValueError):
-        load_config(p)
-
-
-@pytest.mark.parametrize("bad_value", [0, 51, "5", False])
-def test_bad_watch_max_tool_iterations_rejected_on_save(tmp_path, bad_value):
-    """save_config refuses a SET watch value outside [1, 50] or non-int."""
-    cfg = Config()
-    cfg.watches = [
-        WatchTarget(channel_id=1, repo_path="/srv/a",
-                    max_tool_iterations=bad_value),
-    ]
-    p = tmp_path / "config.toml"
-
-    with pytest.raises(ValueError):
-        save_config(cfg, p)
-    assert not p.exists()
-
-
-def test_effective_max_tool_iterations_override_and_inherit():
-    """Watch override wins when set; None inherits the global default."""
-    cfg = Config(max_tool_iterations=6)
-    overridden = WatchTarget(channel_id=1, repo_path="/a",
-                             max_tool_iterations=15)
-    inheriting = WatchTarget(channel_id=2, repo_path="/b")
-
-    assert effective_max_tool_iterations(cfg, overridden) == 15
-    assert effective_max_tool_iterations(cfg, inheriting) == 6
+    assert result.exit_code == 0, result.output
+    assert load_config(path).environment_mode == "server"

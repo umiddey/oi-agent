@@ -88,6 +88,12 @@ def _pinned_stream(final_parts, final_reason="stop", finish_final=True):
 _ERROR_EVENT = {"type": "error", "timestamp": 1, "sessionID": SESSION,
                 "error": {"name": "ProviderAuthError", "data": {"message": "x"}}}
 
+# The exact P1-2 auditor repro: a dict payload whose ``name`` is an arbitrary
+# multi-line hostile string that must never become the error class.
+_LEAK_NAME = "LEAK_MARKER\nraw-detail"
+_LEAK_NAME_ERROR_EVENT = {"type": "error", "timestamp": 1, "sessionID": SESSION,
+                          "error": {"name": _LEAK_NAME}}
+
 # A long, hostile raw-string error payload: fake credentials, path-like
 # fragments, and filler that must never survive classification.
 _HOSTILE_PAYLOAD = (
@@ -131,6 +137,9 @@ _STREAMS = {
     "error_after_text": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [_ERROR_EVENT],
     "hostile_string_error": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [
         _HOSTILE_ERROR_EVENT,
+    ],
+    "hostile_name_error": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [
+        _LEAK_NAME_ERROR_EVENT,
     ],
     "post_finish_text": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [
         _event("text", _part("text", "msg_final", "late", text="SMUGGLED")),
@@ -484,6 +493,60 @@ def test_error_class_string_payloads_are_bounded():
     assert _error_class({"error": {"type": "rate_limit"}}) == "rate_limit"
 
 
+def test_error_class_repro_leaking_dict_name_collapses():
+    """P1-2 repro: a multi-line dict name never becomes the error class."""
+    assert _error_class(_LEAK_NAME_ERROR_EVENT) == "opencode_error"
+    # In-stream precedence still holds: the leaked name cannot ride along
+    # with a completed final answer.
+    text, _, error_class, _ = _select_final_text(
+        _final_step("m1", [("a1", "FINAL")]) + [_LEAK_NAME_ERROR_EVENT]
+    )
+    assert error_class == "opencode_error"
+    assert "LEAK_MARKER" not in (error_class or "")
+    assert "raw-detail" not in (error_class or "")
+
+
+def test_error_class_hostile_dict_candidates_collapse():
+    """Hostile dict name/type shapes fall through to the bounded constant."""
+    hostile_names = [
+        _LEAK_NAME,
+        "A" * 200,                    # valid charset, over the 64-char bound
+        "../etc/passwd",              # path syntax
+        "http://evil.example/leak",   # URL syntax
+        "has spaces",
+        "tab\tseparator",
+        "bell\x07control",
+        {"deeply": "nested"},         # non-string candidates never pass
+        42,
+        None,
+        "",
+    ]
+    for name in hostile_names:
+        event = {"type": "error", "error": {"name": name}}
+        assert _error_class(event) == "opencode_error", repr(name)
+    # A hostile type alone collapses too.
+    assert _error_class({"error": {"type": "http://evil.example"}}) == "opencode_error"
+
+
+def test_error_class_valid_candidates_fall_through_hostile_ones():
+    """Validation falls through name to type; valid enum-like names still win."""
+    # Hostile name falls through to a valid type.
+    assert _error_class({"error": {"name": _LEAK_NAME, "type": "rate_limit"}}) == "rate_limit"
+    assert _error_class({"error": {"name": "../evil", "type": "SessionNotFound"}}) == "SessionNotFound"
+    # A valid name wins even when the type is hostile.
+    assert _error_class({"error": {"name": "ProviderAuthError", "type": _LEAK_NAME}}) == "ProviderAuthError"
+    # Positive controls: enum-like names propagate; punctuation in the
+    # allowlist charset is fine.
+    assert _error_class(_ERROR_EVENT) == "ProviderAuthError"
+    assert _error_class({"error": {"name": "Provider.RateLimit-429"}}) == "Provider.RateLimit-429"
+
+
+def test_error_class_name_length_boundary_at_64():
+    """A 64-char valid-charset name passes; 65 chars collapse (bounded cap)."""
+    assert _error_class({"error": {"name": "A" * 64}}) == "A" * 64
+    assert _error_class({"error": {"name": "A" * 65}}) == "opencode_error"
+
+
 @pytest.mark.asyncio
 async def test_runner_hostile_string_error_payload_is_fully_bounded(tmp_path, monkeypatch):
     """A long hostile string error never leaks into the class or the reply."""
@@ -503,6 +566,27 @@ async def test_runner_hostile_string_error_payload_is_fully_bounded(tmp_path, mo
                      "x" * 256, "/home/operator"):
         assert fragment not in reply.text
         assert fragment not in (reply.error_class or "")
+
+
+@pytest.mark.asyncio
+async def test_runner_leaking_dict_error_name_never_reaches_reply(tmp_path, monkeypatch):
+    """P1-2 repro end to end: a hostile dict error name stays out of the reply."""
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    repo = _repo(tmp_path)
+    binary, _ = _script(tmp_path, "hostile_name_error")
+    cfg = Config(opencode_binary=str(binary), opencode_model="provider/model")
+
+    reply = await OpenCodeRunner(cfg).run(
+        WatchTarget(1, str(repo)), "alice", "question", ""
+    )
+
+    assert reply.ok is False
+    assert reply.error_class == "opencode_error"
+    assert "not going to guess" in reply.text
+    for fragment in ("LEAK_MARKER", "raw-detail"):
+        assert fragment not in reply.text
+        assert fragment not in (reply.error_class or "")
+    assert "UNIQUE_MARKER" not in reply.text
 
 
 def test_reply_cap_preserves_audit_footer():

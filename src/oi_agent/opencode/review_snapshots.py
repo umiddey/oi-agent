@@ -2,12 +2,19 @@
 
 For one explicitly resolved review reference, the trusted controller builds a
 temporary mode-0700 workspace under OI's isolated state root, initializes a
-bare object repository, fetches ONLY the provider-owned refs for the validated
-number (fixed ref templates; never text derived from user input), verifies the
-base/head relationship via the provider merge-result ref parents, archives
-both verified trees with ``git archive``, and extracts them in pure Python
-into read-only directories. The watched worktree is never mutated; only its
-``remote.origin.url`` is read, and that URL is never logged.
+bare object repository, records the origin URL ONLY in that repository's
+config file (the URL can contain credentials and must never appear in process
+arguments), fetches ONLY the provider-owned refs for the validated number
+(fixed ref templates; never text derived from user input), verifies the
+base/head relationship via the provider merge-result ref parents, and
+materializes both verified trees as EXACT Git objects: entries come from
+NUL-delimited ``git ls-tree -rz --full-tree`` and blob bytes stream through a
+single ``git cat-file --batch`` process, so ``.gitattributes`` effects such as
+``export-ignore`` or ``export-subst`` can never omit or alter reviewed
+content. Size limits are enforced while streaming: the entry count before
+materializing, then per-blob and cumulative bytes as payloads arrive. The
+watched worktree is never mutated; only its ``remote.origin.url`` is read,
+and that URL is never logged.
 
 All Git access is argv-only with fixed command templates, bounded captured
 stdout/stderr, explicit timeouts, and sanitized failure classes. Snapshots are
@@ -18,7 +25,8 @@ Failure classes (:class:`ReviewSnapshotError`; ``str(exc)`` is the class):
 
 - ``review_provider_invalid`` / ``review_number_invalid``: defensive input checks.
 - ``review_origin_unreadable``: ``remote.origin.url`` could not be read.
-- ``review_init_failed``: temporary bare repository initialization failed.
+- ``review_init_failed``: temporary bare repository initialization failed,
+  including recording the origin URL in its config file.
 - ``review_ref_unavailable``: the provider head ref does not exist.
 - ``review_fetch_failed``: probe/fetch failed (auth, unreachable, transport).
 - ``review_fetch_timeout``: probe/fetch exceeded the explicit timeout.
@@ -26,10 +34,14 @@ Failure classes (:class:`ReviewSnapshotError`; ``str(exc)`` is the class):
 - ``review_base_unavailable``: provider supplies no trustworthy merge/base ref.
 - ``review_base_unverified``: malformed merge commit, or its second parent is
   not exactly the verified head SHA.
-- ``review_archive_failed``: ``git archive`` of a verified tree failed.
-- ``review_extract_rejected``: unsafe or malformed archive member (path
-  traversal, absolute path, device node, hardlink, sparse entry, escaping
-  symlink, setuid/setgid bits, ``.git`` entry, oversized archive).
+- ``review_tree_failed``: reading a verified tree (ls-tree or the cat-file
+  batch process) failed.
+- ``review_extract_rejected``: unsafe or malformed tree entry (path traversal,
+  absolute path, Windows drive, backslash path, ``.git`` entry, submodule
+  entry, unusual mode, escaping/absolute/``.git``-entering symlink, malformed
+  batch output, incomplete materialization).
+- ``review_snapshot_too_large``: entry count, cumulative bytes, or one blob
+  exceeds the snapshot size limits.
 - ``review_diff_failed``: bounded changed-path manifest generation failed.
 - ``review_snapshot_error``: unexpected boundary failure; never leaks stderr.
 """
@@ -40,12 +52,13 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
-import tarfile
 import tempfile
 import weakref
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from .paths import resolve_opencode_paths
 from .review_target import (
@@ -59,18 +72,22 @@ from .review_target import (
 logger = logging.getLogger(__name__)
 
 MAX_CHANGED_PATHS = 200
+MAX_SNAPSHOT_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_SNAPSHOT_FILES = 50_000
+MAX_SINGLE_BLOB_BYTES = 64 * 1024 * 1024
 
 _LOCAL_REF_PREFIX = "refs/review"
 _GIT_TIMEOUT_SECONDS = 60
 _FETCH_TIMEOUT_SECONDS = 120
 _MAX_MANIFEST_BYTES = 64 * 1024
-_MAX_TAR_MEMBERS = 100_000
-_MAX_TAR_TOTAL_BYTES = 512 * 1024 * 1024
+_MAX_LS_TREE_BYTES = 32 * 1024 * 1024
+_MAX_BATCH_HEADER_BYTES = 128
+_CHUNK_BYTES = 64 * 1024
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
-_ALLOWED_TAR_TYPES = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE)
 _READ_ONLY_DIR_MODE = 0o555
 _READ_ONLY_FILE_MODE = 0o444
+_READ_ONLY_EXEC_FILE_MODE = 0o500
 
 
 class ReviewSnapshotError(ValueError):
@@ -128,6 +145,23 @@ class _GitOutcome:
     timed_out: bool = False
 
 
+@dataclass(frozen=True)
+class _TreeEntry:
+    """One validated ``ls-tree -r`` record of a verified tree.
+
+    Attributes:
+        path: Slash-separated path relative to the tree root.
+        sha: Full 40-hex blob SHA backing the entry.
+        executable: Whether the blob mode is ``100755``.
+        is_symlink: Whether the blob mode is ``120000`` (target is content).
+    """
+
+    path: str
+    sha: str
+    executable: bool
+    is_symlink: bool
+
+
 def _git_env() -> dict[str, str]:
     """Return the ambient environment with interactive Git prompts disabled."""
     return {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -160,6 +194,16 @@ def _fail(failure_class: str, provider: str, number: int) -> ReviewSnapshotError
     return ReviewSnapshotError(failure_class)
 
 
+def _validate_inputs(provider: str, number: int) -> None:
+    """Defensively re-validate provider and number before any Git activity."""
+    if provider not in (PROVIDER_GITLAB, PROVIDER_GITHUB):
+        raise ReviewSnapshotError("review_provider_invalid")
+    if isinstance(number, bool) or not isinstance(number, int):
+        raise ReviewSnapshotError("review_number_invalid")
+    if number < 1 or number > MAX_REVIEW_NUMBER:
+        raise ReviewSnapshotError("review_number_invalid")
+
+
 def _snapshot_root() -> Path | None:
     """Return OI's isolated reviews root, or None to fall back to tempfile."""
     try:
@@ -171,19 +215,41 @@ def _snapshot_root() -> Path | None:
         return None
 
 
-def _validate_inputs(provider: str, number: int) -> None:
-    """Defensively re-validate provider and number before any Git activity."""
-    if provider not in (PROVIDER_GITLAB, PROVIDER_GITHUB):
-        raise ReviewSnapshotError("review_provider_invalid")
-    if isinstance(number, bool) or not isinstance(number, int):
-        raise ReviewSnapshotError("review_number_invalid")
-    if number < 1 or number > MAX_REVIEW_NUMBER:
-        raise ReviewSnapshotError("review_number_invalid")
+def _quote_git_config(value: str) -> str:
+    """Quote one value for a git-config file: double quotes with escapes."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
+def _write_remote_config(bare: Path, origin: str) -> bool:
+    """Record ``remote.origin.url`` in the bare repository's config file.
+
+    The URL may contain credentials and must never appear in process
+    arguments, so it is written directly into the config file instead of via
+    ``git config``/``git remote add`` (both would put it in argv). Values
+    containing line breaks cannot be stored as one config line and fail
+    closed.
+
+    Args:
+        bare: Newly initialized temporary bare repository.
+        origin: The watched repository's origin URL (never logged).
+
+    Returns:
+        ``True`` when the remote section was written.
+    """
+    if not origin or "\n" in origin or "\r" in origin:
+        return False
+    section = '[remote "origin"]\n\turl = ' + _quote_git_config(origin) + "\n"
+    try:
+        with (bare / "config").open("a", encoding="utf-8") as handle:
+            handle.write(section)
+    except OSError:
+        return False
+    return True
 
 
 def _fetch_ref(
     bare: Path,
-    origin: str,
     remote_ref: str,
     local_ref: str,
     *,
@@ -193,9 +259,12 @@ def _fetch_ref(
 ) -> bool:
     """Fetch one fixed provider-owned ref into the temporary bare repository.
 
+    Only the remote NAME is passed on the command line; Git reads the origin
+    URL from the config file written by :func:`_write_remote_config`, so a
+    credentialed URL never appears in process arguments.
+
     Args:
-        bare: Temporary bare object repository.
-        origin: The watched repository's origin URL (never logged).
+        bare: Temporary bare object repository with ``remote.origin.url``.
         remote_ref: Fixed provider ref template with the validated integer.
         local_ref: Fixed local ref name inside the temporary repository.
         required: Whether an absent remote ref is itself a failure.
@@ -209,7 +278,7 @@ def _fetch_ref(
         ReviewSnapshotError: Bounded fetch/unavailable/timeout classes.
     """
     probe = _run_git(
-        ["git", "-C", str(bare), "ls-remote", origin, remote_ref],
+        ["git", "-C", str(bare), "ls-remote", "origin", remote_ref],
         _FETCH_TIMEOUT_SECONDS,
     )
     if probe.timed_out:
@@ -227,7 +296,7 @@ def _fetch_ref(
             raise _fail("review_ref_unavailable", provider, number)
         return False
     fetch = _run_git(
-        ["git", "-C", str(bare), "fetch", "--no-tags", origin, f"+{remote_ref}:{local_ref}"],
+        ["git", "-C", str(bare), "fetch", "--no-tags", "origin", f"+{remote_ref}:{local_ref}"],
         _FETCH_TIMEOUT_SECONDS,
     )
     if fetch.timed_out:
@@ -283,42 +352,205 @@ def _verified_base(bare: Path, head_sha: str) -> str | None:
     return tokens[1]
 
 
-def _materialize(bare: Path, sha: str, dest: Path, role: str) -> None:
-    """Archive one verified tree to a fixed temp path and extract it safely."""
-    tar_path = dest.parent / f"{role}.tar"
-    outcome = _run_git(
-        ["git", "-C", str(bare), "archive", "--format=tar", f"--output={tar_path}", sha],
-        _GIT_TIMEOUT_SECONDS,
-    )
-    if outcome.timed_out or outcome.returncode != 0:
-        raise ReviewSnapshotError("review_archive_failed")
-    try:
-        _extract_snapshot_tar(tar_path, dest)
-    finally:
-        try:
-            tar_path.unlink()
-        except OSError:
-            pass
-    _make_read_only(dest)
+def _validate_tree_path(name: str) -> None:
+    """Reject traversal, absolute paths, Windows drives, backslashes, .git.
 
-
-def _validate_member_name(name: str) -> None:
-    """Reject traversal, absolute paths, Windows drives, backslashes, .git."""
+    Only a literal ``.git`` path component is rejected; ordinary files such
+    as ``.gitmodules`` and ``.gitignore`` are allowed.
+    """
     posix = PurePosixPath(name)
-    if posix.is_absolute() or ".." in posix.parts or "\\" in name or _DRIVE_RE.match(name):
+    if (
+        not name
+        or posix.is_absolute()
+        or ".." in posix.parts
+        or "\\" in name
+        or _DRIVE_RE.match(name)
+        or "//" in name
+        or name == "."
+    ):
         raise ReviewSnapshotError("review_extract_rejected")
     if any(part == ".git" for part in posix.parts):
         raise ReviewSnapshotError("review_extract_rejected")
 
 
-def _validate_symlink(dest: Path, name: str, link_target: str, root_real: str) -> None:
-    """Reject symlinks that are absolute or escape the snapshot root."""
-    if not link_target or link_target.startswith("/"):
+def _parse_ls_tree(raw: str) -> tuple[_TreeEntry, ...]:
+    """Parse NUL-delimited ``ls-tree -r`` records into validated entries.
+
+    Only blobs with modes ``100644``, ``100755``, and ``120000`` are
+    accepted; submodules (``160000``), trees, and any unusual mode fail the
+    whole materialization.
+
+    Raises:
+        ReviewSnapshotError: ``review_extract_rejected`` on any malformed or
+            disallowed record.
+    """
+    entries: list[_TreeEntry] = []
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        meta, separator, path = record.partition("\t")
+        if not separator:
+            raise ReviewSnapshotError("review_extract_rejected")
+        _validate_tree_path(path)
+        fields = meta.split(" ")
+        if len(fields) != 3:
+            raise ReviewSnapshotError("review_extract_rejected")
+        mode, obj_type, obj_sha = fields
+        if not _SHA_RE.match(obj_sha):
+            raise ReviewSnapshotError("review_extract_rejected")
+        if obj_type == "blob" and mode in ("100644", "100755"):
+            entries.append(
+                _TreeEntry(
+                    path=path, sha=obj_sha,
+                    executable=mode == "100755", is_symlink=False,
+                )
+            )
+        elif obj_type == "blob" and mode == "120000":
+            entries.append(
+                _TreeEntry(path=path, sha=obj_sha, executable=False, is_symlink=True)
+            )
+        else:
+            raise ReviewSnapshotError("review_extract_rejected")
+    return tuple(entries)
+
+
+def _ls_tree_entries(bare: Path, sha: str) -> tuple[_TreeEntry, ...]:
+    """List every entry of one verified tree with NUL-delimited ls-tree.
+
+    Args:
+        bare: Temporary bare object repository holding the verified objects.
+        sha: Verified full commit SHA.
+
+    Returns:
+        Validated tree entries, or an empty tuple for an empty tree.
+
+    Raises:
+        ReviewSnapshotError: ``review_tree_failed`` when ls-tree fails;
+            ``review_snapshot_too_large`` when the listing overflows its
+            bounded capture window.
+    """
+    argv = ["git", "-C", str(bare), "ls-tree", "-rz", "--full-tree", sha]
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_git_env(),
+        )
+    except OSError:
+        raise ReviewSnapshotError("review_tree_failed") from None
+    raw = b""
+    try:
+        assert proc.stdout is not None
+        raw = proc.stdout.read(_MAX_LS_TREE_BYTES + 1)
+        if len(raw) > _MAX_LS_TREE_BYTES:
+            proc.kill()
+            proc.wait()
+            raise ReviewSnapshotError("review_snapshot_too_large")
+        try:
+            returncode = proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise ReviewSnapshotError("review_tree_failed") from None
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    if returncode != 0:
+        raise ReviewSnapshotError("review_tree_failed")
+    return _parse_ls_tree(raw.decode("utf-8", errors="surrogateescape"))
+
+
+def _reject_symlink_ancestors(path: str, symlink_paths: set[str]) -> None:
+    """Reject entries located below a path that itself materialized as a
+    symlink: nothing may be written through a link."""
+    ancestor = ""
+    for part in PurePosixPath(path).parts[:-1]:
+        ancestor = f"{ancestor}/{part}" if ancestor else part
+        if ancestor in symlink_paths:
+            raise ReviewSnapshotError("review_extract_rejected")
+
+
+def _spawn_cat_file(bare: Path) -> subprocess.Popen[bytes]:
+    """Start one ``git cat-file --batch`` process for exact object payloads."""
+    try:
+        return subprocess.Popen(
+            ["git", "-C", str(bare), "cat-file", "--batch"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_git_env(),
+        )
+    except OSError:
+        raise ReviewSnapshotError("review_tree_failed") from None
+
+
+def _close_cat_file(proc: subprocess.Popen[bytes]) -> None:
+    """Close and reap one cat-file process without leaking exceptions."""
+    for stream in (proc.stdin, proc.stdout):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _read_batch_header(stream: BinaryIO) -> tuple[str, str, int]:
+    """Read one ``<oid> <type> <size>`` cat-file batch header line.
+
+    Raises:
+        ReviewSnapshotError: ``review_extract_rejected`` on a truncated,
+            oversized, or malformed header (including ``<oid> missing``).
+    """
+    header = bytearray()
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            raise ReviewSnapshotError("review_extract_rejected")
+        if byte == b"\n":
+            break
+        header.extend(byte)
+        if len(header) > _MAX_BATCH_HEADER_BYTES:
+            raise ReviewSnapshotError("review_extract_rejected")
+    fields = header.decode("ascii", errors="replace").split(" ")
+    if len(fields) != 3 or not _SHA_RE.match(fields[0]):
         raise ReviewSnapshotError("review_extract_rejected")
-    parent_real = os.path.realpath(os.path.dirname(str(dest / name)))
-    resolved = os.path.normpath(os.path.join(parent_real, link_target))
-    if resolved != root_real and not resolved.startswith(root_real + os.sep):
+    oid, obj_type, size_text = fields
+    if obj_type not in ("blob", "tree", "commit", "tag"):
         raise ReviewSnapshotError("review_extract_rejected")
+    try:
+        size = int(size_text)
+    except ValueError:
+        raise ReviewSnapshotError("review_extract_rejected") from None
+    if size < 0:
+        raise ReviewSnapshotError("review_extract_rejected")
+    return oid, obj_type, size
+
+
+def _read_exact(stream: BinaryIO, count: int) -> bytes:
+    """Read exactly ``count`` bounded bytes from the batch stream.
+
+    Raises:
+        ReviewSnapshotError: ``review_extract_rejected`` on truncation.
+    """
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = stream.read(min(remaining, _CHUNK_BYTES))
+        if not chunk:
+            raise ReviewSnapshotError("review_extract_rejected")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _entry_parent(dest: Path, name: str) -> Path:
+    """Return the materialized parent directory for one validated entry."""
+    parts = PurePosixPath(name).parts[:-1]
+    return dest.joinpath(*parts) if parts else dest
 
 
 def _makedirs(target: Path) -> None:
@@ -329,68 +561,152 @@ def _makedirs(target: Path) -> None:
         raise ReviewSnapshotError("review_extract_rejected") from None
 
 
-def _extract_snapshot_tar(tar_path: Path, dest: Path) -> None:
-    """Extract a ``git archive`` tar safely, rejecting any unsafe member.
+def _validate_symlink(dest: Path, name: str, link_target: str, root_real: str) -> None:
+    """Reject absolute, escaping, or ``.git``-entering symlink targets."""
+    if not link_target or link_target.startswith("/"):
+        raise ReviewSnapshotError("review_extract_rejected")
+    if any(part == ".git" for part in PurePosixPath(link_target).parts):
+        raise ReviewSnapshotError("review_extract_rejected")
+    parent_real = os.path.realpath(os.path.dirname(str(dest / name)))
+    resolved = os.path.normpath(os.path.join(parent_real, link_target))
+    if resolved != root_real and not resolved.startswith(root_real + os.sep):
+        raise ReviewSnapshotError("review_extract_rejected")
 
-    Rejects path traversal, absolute paths, Windows drives, device nodes,
-    hardlinks, sparse entries, escaping or absolute symlinks, setuid/setgid
-    bits, ``.git`` entries, and oversized archives. Extracted content is
-    private (files 0o600, directories 0o700); the caller applies the
-    read-only pass afterwards.
+
+def _write_blob_file(
+    target: Path, stream: BinaryIO, size: int, executable: bool,
+) -> None:
+    """Stream one exact blob payload to a new private file, then consume LF.
 
     Args:
-        tar_path: Fixed temp path of the archived tree.
-        dest: Extraction root (created with mode 0o700).
+        target: Validated in-snapshot destination path.
+        stream: cat-file batch stdout positioned at the payload.
+        size: Payload size declared by the (already limit-checked) header.
+        executable: Whether to set the owner-exec bit while writing.
 
     Raises:
-        ReviewSnapshotError: ``review_extract_rejected`` on any unsafe member.
+        ReviewSnapshotError: ``review_extract_rejected`` when the file cannot
+            be created exclusively or the batch stream truncates.
     """
-    dest.mkdir(mode=0o700)
-    root_real = str(dest.resolve())
+    _makedirs(target.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(target), flags, 0o700 if executable else 0o600)
+    except OSError:
+        raise ReviewSnapshotError("review_extract_rejected") from None
+    try:
+        remaining = size
+        while remaining > 0:
+            chunk = stream.read(min(remaining, _CHUNK_BYTES))
+            if not chunk:
+                raise ReviewSnapshotError("review_extract_rejected")
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(fd, chunk[offset:])
+                if written <= 0:
+                    raise ReviewSnapshotError("review_extract_rejected")
+                offset += written
+            remaining -= len(chunk)
+        if stream.read(1) != b"\n":
+            raise ReviewSnapshotError("review_extract_rejected")
+    finally:
+        os.close(fd)
+
+
+def _write_entries(
+    bare: Path, entries: tuple[_TreeEntry, ...], dest: Path, root_real: str,
+) -> None:
+    """Copy every verified tree entry exactly through one cat-file batch.
+
+    Enforces the per-blob and cumulative size limits before and while each
+    payload streams, validates symlink targets exactly like the entry paths,
+    and verifies that the materialized path set equals the ls-tree entry set.
+
+    Raises:
+        ReviewSnapshotError: ``review_snapshot_too_large`` on a size breach;
+            ``review_extract_rejected`` on any unsafe or incomplete entry.
+    """
+    symlink_paths = {entry.path for entry in entries if entry.is_symlink}
+    materialized: set[str] = set()
     total_bytes = 0
-    members = 0
-    with tarfile.open(tar_path, "r:") as archive:
-        for member in archive:
-            members += 1
-            if members > _MAX_TAR_MEMBERS or member.type not in _ALLOWED_TAR_TYPES:
+    proc = _spawn_cat_file(bare)
+    try:
+        stdin = proc.stdin
+        stdout = proc.stdout
+        assert stdin is not None and stdout is not None
+        for entry in entries:
+            stdin.write(entry.sha.encode("ascii") + b"\n")
+            stdin.flush()
+            oid, obj_type, size = _read_batch_header(stdout)
+            if oid != entry.sha or obj_type != "blob":
                 raise ReviewSnapshotError("review_extract_rejected")
-            name = (member.name or "").rstrip("/")
-            if not name:
-                continue
-            _validate_member_name(name)
-            if (member.mode & 0o6000) != 0:
-                raise ReviewSnapshotError("review_extract_rejected")
-            total_bytes += max(member.size, 0)
-            if total_bytes > _MAX_TAR_TOTAL_BYTES:
-                raise ReviewSnapshotError("review_extract_rejected")
-            target = dest / name
-            parent_real = os.path.normpath(os.path.dirname(str(target)))
-            if parent_real != root_real and not parent_real.startswith(root_real + os.sep):
-                raise ReviewSnapshotError("review_extract_rejected")
-            if member.type == tarfile.DIRTYPE:
-                _makedirs(target)
-                continue
-            if member.type == tarfile.SYMTYPE:
-                _validate_symlink(dest, name, member.linkname, root_real)
+            if size > MAX_SINGLE_BLOB_BYTES:
+                raise ReviewSnapshotError("review_snapshot_too_large")
+            if total_bytes + size > MAX_SNAPSHOT_TOTAL_BYTES:
+                raise ReviewSnapshotError("review_snapshot_too_large")
+            total_bytes += size
+            _reject_symlink_ancestors(entry.path, symlink_paths)
+            target = dest.joinpath(*PurePosixPath(entry.path).parts)
+            if entry.is_symlink:
+                payload = _read_exact(stdout, size)
+                if stdout.read(1) != b"\n":
+                    raise ReviewSnapshotError("review_extract_rejected")
+                _makedirs(_entry_parent(dest, entry.path))
+                link_target = payload.decode("utf-8", errors="surrogateescape")
+                _validate_symlink(dest, entry.path, link_target, root_real)
                 try:
-                    os.symlink(member.linkname, target)
+                    os.symlink(link_target, target)
                 except OSError:
                     raise ReviewSnapshotError("review_extract_rejected") from None
-                continue
-            source = archive.extractfile(member)
-            if source is None:
-                raise ReviewSnapshotError("review_extract_rejected")
-            _makedirs(target.parent)
-            with target.open("wb") as handle:
-                shutil.copyfileobj(source, handle)
+            else:
+                _write_blob_file(target, stdout, size, entry.executable)
+            materialized.add(entry.path)
+        if materialized != {entry.path for entry in entries}:
+            raise ReviewSnapshotError("review_extract_rejected")
+    except ReviewSnapshotError:
+        raise
+    except OSError:
+        raise ReviewSnapshotError("review_tree_failed") from None
+    finally:
+        _close_cat_file(proc)
+
+
+def _materialize(bare: Path, sha: str, dest: Path) -> None:
+    """Materialize one verified commit's exact tree read-only.
+
+    Enumerates entries with ``git ls-tree -rz --full-tree`` and copies exact
+    blob bytes through a single ``git cat-file --batch`` process; no archive
+    is produced, so ``.gitattributes`` (``export-ignore``, ``export-subst``)
+    can never omit or alter reviewed content.
+
+    Args:
+        bare: Temporary bare object repository holding the verified objects.
+        sha: Verified full commit SHA.
+        dest: Fresh directory to fill (created with mode 0o700).
+
+    Raises:
+        ReviewSnapshotError: Bounded tree/too-large/rejected classes.
+    """
+    entries = _ls_tree_entries(bare, sha)
+    if len(entries) > MAX_SNAPSHOT_FILES:
+        raise ReviewSnapshotError("review_snapshot_too_large")
+    dest.mkdir(mode=0o700)
+    root_real = str(dest.resolve())
+    _write_entries(bare, entries, dest, root_real)
+    _make_read_only(dest)
 
 
 def _make_read_only(root: Path) -> None:
-    """Freeze a snapshot tree for the audit: files 0o444, directories 0o555."""
+    """Freeze a snapshot tree: files 0o444 (0o500 when executable), dirs 0o555."""
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
         for name in filenames:
+            path = os.path.join(dirpath, name)
             try:
-                os.chmod(os.path.join(dirpath, name), _READ_ONLY_FILE_MODE)
+                executable = stat.S_IMODE(os.stat(path).st_mode) & 0o100
+                os.chmod(
+                    path,
+                    _READ_ONLY_EXEC_FILE_MODE if executable else _READ_ONLY_FILE_MODE,
+                )
             except OSError:
                 pass
         for name in dirnames:
@@ -545,14 +861,16 @@ class MaterializedReview:
             init = _run_git(["git", "init", "--bare", "-q", str(bare)], _GIT_TIMEOUT_SECONDS)
             if init.timed_out or init.returncode != 0:
                 raise _fail("review_init_failed", provider, number)
+            if not _write_remote_config(bare, origin):
+                raise _fail("review_init_failed", provider, number)
             head_ref = provider_ref_template(provider, number, "head")
             merge_ref = provider_ref_template(provider, number, "merge")
             _fetch_ref(
-                bare, origin, head_ref, f"{_LOCAL_REF_PREFIX}/head",
+                bare, head_ref, f"{_LOCAL_REF_PREFIX}/head",
                 required=True, provider=provider, number=number,
             )
             merge_present = _fetch_ref(
-                bare, origin, merge_ref, f"{_LOCAL_REF_PREFIX}/merge",
+                bare, merge_ref, f"{_LOCAL_REF_PREFIX}/merge",
                 required=False, provider=provider, number=number,
             )
             head_sha = _resolve_commit(bare, f"{_LOCAL_REF_PREFIX}/head")
@@ -565,8 +883,8 @@ class MaterializedReview:
                 raise _fail("review_base_unverified", provider, number)
             base_dir = self._tmp_root / "base"
             head_dir = self._tmp_root / "head"
-            _materialize(bare, base_sha, base_dir, "base")
-            _materialize(bare, head_sha, head_dir, "head")
+            _materialize(bare, base_sha, base_dir)
+            _materialize(bare, head_sha, head_dir)
             manifest, truncated = _changed_manifest(bare, base_sha, head_sha)
         except ReviewSnapshotError:
             raise

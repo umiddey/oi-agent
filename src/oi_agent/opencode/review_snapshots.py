@@ -51,10 +51,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import select
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import weakref
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -160,6 +162,101 @@ class _TreeEntry:
     sha: str
     executable: bool
     is_symlink: bool
+
+class _DeadlineReader:
+    """Read a subprocess pipe through one absolute monotonic deadline."""
+
+    def __init__(
+        self, stream: BinaryIO, timeout: float, failure_class: str,
+        malformed_class: str | None = None,
+    ) -> None:
+        self._fd = stream.fileno()
+        self._deadline = time.monotonic() + timeout
+        self._failure_class = failure_class
+        self._malformed_class = malformed_class or failure_class
+        self._buffer = bytearray()
+        self._eof = False
+
+    def remaining(self) -> float:
+        """Return seconds remaining before the shared deadline."""
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewSnapshotError(self._failure_class)
+        return remaining
+
+    def _fill(self) -> bool:
+        """Read one available chunk, returning False only at EOF."""
+        if self._eof:
+            return False
+        try:
+            ready, _, _ = select.select([self._fd], [], [], self.remaining())
+        except (OSError, ValueError):
+            raise ReviewSnapshotError(self._failure_class) from None
+        if not ready:
+            raise ReviewSnapshotError(self._failure_class)
+        try:
+            chunk = os.read(self._fd, _CHUNK_BYTES)
+        except OSError:
+            raise ReviewSnapshotError(self._failure_class) from None
+        if not chunk:
+            self._eof = True
+            return False
+        self._buffer.extend(chunk)
+        return True
+
+    def read_to_eof(self, limit: int) -> bytes:
+        """Read through EOF, retaining at most ``limit`` bytes."""
+        while len(self._buffer) < limit and self._fill():
+            pass
+        return bytes(self._buffer[:limit])
+
+    def read_exact(self, count: int) -> bytes:
+        """Read exactly ``count`` bytes or fail on timeout/truncation."""
+        while len(self._buffer) < count:
+            if not self._fill():
+                raise ReviewSnapshotError(self._malformed_class)
+        result = bytes(self._buffer[:count])
+        del self._buffer[:count]
+        return result
+
+    def readline(self, limit: int) -> bytes:
+        """Read one LF-terminated line bounded by ``limit`` bytes."""
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline != -1:
+                if newline > limit:
+                    raise ReviewSnapshotError(self._malformed_class)
+                result = bytes(self._buffer[:newline])
+                del self._buffer[:newline + 1]
+                return result
+            if len(self._buffer) > limit:
+                raise ReviewSnapshotError(self._malformed_class)
+            if not self._fill():
+                raise ReviewSnapshotError(self._malformed_class)
+
+
+def _stop_process(proc: subprocess.Popen[bytes]) -> None:
+    """Kill and reap a subprocess without leaking cleanup failures."""
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _wait_before_deadline(
+    proc: subprocess.Popen[bytes], reader: _DeadlineReader, failure_class: str,
+) -> int:
+    """Wait for a subprocess using the same deadline as its pipe reads."""
+    try:
+        return proc.wait(timeout=reader.remaining())
+    except (OSError, subprocess.SubprocessError):
+        _stop_process(proc)
+        raise ReviewSnapshotError(failure_class) from None
 
 
 def _git_env() -> dict[str, str]:
@@ -415,20 +512,7 @@ def _parse_ls_tree(raw: str) -> tuple[_TreeEntry, ...]:
 
 
 def _ls_tree_entries(bare: Path, sha: str) -> tuple[_TreeEntry, ...]:
-    """List every entry of one verified tree with NUL-delimited ls-tree.
-
-    Args:
-        bare: Temporary bare object repository holding the verified objects.
-        sha: Verified full commit SHA.
-
-    Returns:
-        Validated tree entries, or an empty tuple for an empty tree.
-
-    Raises:
-        ReviewSnapshotError: ``review_tree_failed`` when ls-tree fails;
-            ``review_snapshot_too_large`` when the listing overflows its
-            bounded capture window.
-    """
+    """List every tree entry with bounded, deadline-aware output reads."""
     argv = ["git", "-C", str(bare), "ls-tree", "-rz", "--full-tree", sha]
     try:
         proc = subprocess.Popen(
@@ -436,25 +520,20 @@ def _ls_tree_entries(bare: Path, sha: str) -> tuple[_TreeEntry, ...]:
         )
     except OSError:
         raise ReviewSnapshotError("review_tree_failed") from None
-    raw = b""
     try:
         assert proc.stdout is not None
-        raw = proc.stdout.read(_MAX_LS_TREE_BYTES + 1)
+        reader = _DeadlineReader(proc.stdout, _GIT_TIMEOUT_SECONDS, "review_tree_failed")
+        raw = reader.read_to_eof(_MAX_LS_TREE_BYTES + 1)
         if len(raw) > _MAX_LS_TREE_BYTES:
-            proc.kill()
-            proc.wait()
             raise ReviewSnapshotError("review_snapshot_too_large")
-        try:
-            returncode = proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise ReviewSnapshotError("review_tree_failed") from None
+        if _wait_before_deadline(proc, reader, "review_tree_failed") != 0:
+            raise ReviewSnapshotError("review_tree_failed")
+    except ReviewSnapshotError:
+        _stop_process(proc)
+        raise
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
-    if returncode != 0:
-        raise ReviewSnapshotError("review_tree_failed")
     return _parse_ls_tree(raw.decode("utf-8", errors="surrogateescape"))
 
 
@@ -490,32 +569,14 @@ def _close_cat_file(proc: subprocess.Popen[bytes]) -> None:
                 stream.close()
             except OSError:
                 pass
-    if proc.poll() is None:
-        proc.kill()
-    try:
-        proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    _stop_process(proc)
 
 
-def _read_batch_header(stream: BinaryIO) -> tuple[str, str, int]:
-    """Read one ``<oid> <type> <size>`` cat-file batch header line.
-
-    Raises:
-        ReviewSnapshotError: ``review_extract_rejected`` on a truncated,
-            oversized, or malformed header (including ``<oid> missing``).
-    """
-    header = bytearray()
-    while True:
-        byte = stream.read(1)
-        if not byte:
-            raise ReviewSnapshotError("review_extract_rejected")
-        if byte == b"\n":
-            break
-        header.extend(byte)
-        if len(header) > _MAX_BATCH_HEADER_BYTES:
-            raise ReviewSnapshotError("review_extract_rejected")
-    fields = header.decode("ascii", errors="replace").split(" ")
+def _read_batch_header(reader: _DeadlineReader) -> tuple[str, str, int]:
+    """Read one bounded ``<oid> <type> <size>`` cat-file batch header."""
+    fields = reader.readline(_MAX_BATCH_HEADER_BYTES).decode(
+        "ascii", errors="replace",
+    ).split(" ")
     if len(fields) != 3 or not _SHA_RE.match(fields[0]):
         raise ReviewSnapshotError("review_extract_rejected")
     oid, obj_type, size_text = fields
@@ -528,23 +589,6 @@ def _read_batch_header(stream: BinaryIO) -> tuple[str, str, int]:
     if size < 0:
         raise ReviewSnapshotError("review_extract_rejected")
     return oid, obj_type, size
-
-
-def _read_exact(stream: BinaryIO, count: int) -> bytes:
-    """Read exactly ``count`` bounded bytes from the batch stream.
-
-    Raises:
-        ReviewSnapshotError: ``review_extract_rejected`` on truncation.
-    """
-    chunks: list[bytes] = []
-    remaining = count
-    while remaining > 0:
-        chunk = stream.read(min(remaining, _CHUNK_BYTES))
-        if not chunk:
-            raise ReviewSnapshotError("review_extract_rejected")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
 
 
 def _entry_parent(dest: Path, name: str) -> Path:
@@ -574,20 +618,9 @@ def _validate_symlink(dest: Path, name: str, link_target: str, root_real: str) -
 
 
 def _write_blob_file(
-    target: Path, stream: BinaryIO, size: int, executable: bool,
+    target: Path, reader: _DeadlineReader, size: int, executable: bool,
 ) -> None:
-    """Stream one exact blob payload to a new private file, then consume LF.
-
-    Args:
-        target: Validated in-snapshot destination path.
-        stream: cat-file batch stdout positioned at the payload.
-        size: Payload size declared by the (already limit-checked) header.
-        executable: Whether to set the owner-exec bit while writing.
-
-    Raises:
-        ReviewSnapshotError: ``review_extract_rejected`` when the file cannot
-            be created exclusively or the batch stream truncates.
-    """
+    """Stream one exact blob to a private file within the shared deadline."""
     _makedirs(target.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -597,9 +630,7 @@ def _write_blob_file(
     try:
         remaining = size
         while remaining > 0:
-            chunk = stream.read(min(remaining, _CHUNK_BYTES))
-            if not chunk:
-                raise ReviewSnapshotError("review_extract_rejected")
+            chunk = reader.read_exact(min(remaining, _CHUNK_BYTES))
             offset = 0
             while offset < len(chunk):
                 written = os.write(fd, chunk[offset:])
@@ -607,7 +638,7 @@ def _write_blob_file(
                     raise ReviewSnapshotError("review_extract_rejected")
                 offset += written
             remaining -= len(chunk)
-        if stream.read(1) != b"\n":
+        if reader.read_exact(1) != b"\n":
             raise ReviewSnapshotError("review_extract_rejected")
     finally:
         os.close(fd)
@@ -634,10 +665,14 @@ def _write_entries(
         stdin = proc.stdin
         stdout = proc.stdout
         assert stdin is not None and stdout is not None
+        reader = _DeadlineReader(
+            stdout, _GIT_TIMEOUT_SECONDS, "review_tree_failed",
+            "review_extract_rejected",
+        )
         for entry in entries:
             stdin.write(entry.sha.encode("ascii") + b"\n")
             stdin.flush()
-            oid, obj_type, size = _read_batch_header(stdout)
+            oid, obj_type, size = _read_batch_header(reader)
             if oid != entry.sha or obj_type != "blob":
                 raise ReviewSnapshotError("review_extract_rejected")
             if size > MAX_SINGLE_BLOB_BYTES:
@@ -648,8 +683,8 @@ def _write_entries(
             _reject_symlink_ancestors(entry.path, symlink_paths)
             target = dest.joinpath(*PurePosixPath(entry.path).parts)
             if entry.is_symlink:
-                payload = _read_exact(stdout, size)
-                if stdout.read(1) != b"\n":
+                payload = reader.read_exact(size)
+                if reader.read_exact(1) != b"\n":
                     raise ReviewSnapshotError("review_extract_rejected")
                 _makedirs(_entry_parent(dest, entry.path))
                 link_target = payload.decode("utf-8", errors="surrogateescape")
@@ -659,7 +694,7 @@ def _write_entries(
                 except OSError:
                     raise ReviewSnapshotError("review_extract_rejected") from None
             else:
-                _write_blob_file(target, stdout, size, entry.executable)
+                _write_blob_file(target, reader, size, entry.executable)
             materialized.add(entry.path)
         if materialized != {entry.path for entry in entries}:
             raise ReviewSnapshotError("review_extract_rejected")
@@ -747,23 +782,7 @@ def _cleanup_root(root_str: str) -> None:
 def _changed_manifest(
     bare: Path, base_sha: str, head_sha: str
 ) -> tuple[tuple[ChangedPath, ...], bool]:
-    """Build the bounded changed-path manifest between verified SHAs.
-
-    Reads at most ``_MAX_MANIFEST_BYTES`` of NUL-separated ``git diff
-    --name-status -z`` output and at most ``MAX_CHANGED_PATHS`` entries,
-    reporting honest truncation. No patch contents are produced anywhere.
-
-    Args:
-        bare: Temporary bare object repository.
-        base_sha: Verified base SHA.
-        head_sha: Verified head SHA.
-
-    Returns:
-        ``(entries, truncated)``.
-
-    Raises:
-        ReviewSnapshotError: ``review_diff_failed`` when the diff fails.
-    """
+    """Build the bounded changed-path manifest with deadline-aware I/O."""
     argv = [
         "git", "-C", str(bare), "-c", "core.quotepath=false",
         "diff", "--name-status", "-z", base_sha, head_sha,
@@ -774,25 +793,21 @@ def _changed_manifest(
         )
     except OSError:
         raise ReviewSnapshotError("review_diff_failed") from None
-    truncated = False
-    raw = b""
     try:
         assert proc.stdout is not None
-        raw = proc.stdout.read(_MAX_MANIFEST_BYTES + 1)
-        if len(raw) > _MAX_MANIFEST_BYTES:
-            truncated = True
-            proc.kill()
-        try:
-            returncode = proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise ReviewSnapshotError("review_diff_failed") from None
+        reader = _DeadlineReader(proc.stdout, _GIT_TIMEOUT_SECONDS, "review_diff_failed")
+        raw = reader.read_to_eof(_MAX_MANIFEST_BYTES + 1)
+        truncated = len(raw) > _MAX_MANIFEST_BYTES
+        if truncated:
+            _stop_process(proc)
+        elif _wait_before_deadline(proc, reader, "review_diff_failed") != 0:
+            raise ReviewSnapshotError("review_diff_failed")
+    except ReviewSnapshotError:
+        _stop_process(proc)
+        raise
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
-    if not truncated and returncode != 0:
-        raise ReviewSnapshotError("review_diff_failed")
     fields = raw[:_MAX_MANIFEST_BYTES].decode("utf-8", errors="replace").split("\0")
     entries: list[ChangedPath] = []
     index = 0

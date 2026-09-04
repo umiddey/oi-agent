@@ -1,41 +1,45 @@
 """Tests for immutable controller-owned MR/PR base/head snapshots.
 
 Uses temporary local Git repositories and hand-created provider refs; no
-network and no real credentials. Asserts verification, safe extraction,
-bounded manifests, argv discipline, worktree immutability, and cleanup on
-every exit path.
+network and no real credentials. Asserts verification, exact-object
+materialization (``export-ignore``/``export-subst`` cannot hide or alter
+content), crafted-tree rejection, streaming size limits, argv discipline
+(origin URLs never appear in process arguments), bounded manifests, worktree
+immutability, and cleanup on every exit path.
 """
 
 from __future__ import annotations
 
 import gc
-import io
 import os
 import stat
 import subprocess
-import tarfile
 from pathlib import Path
 
 import pytest
 
+from oi_agent.opencode import review_snapshots
 from oi_agent.opencode.paths import resolve_opencode_paths
 from oi_agent.opencode.provenance import worktree_fingerprint
 from oi_agent.opencode.review_snapshots import (
     MAX_CHANGED_PATHS,
     ReviewSnapshotError,
-    _extract_snapshot_tar,
+    _reject_symlink_ancestors,
+    _validate_tree_path,
+    _write_remote_config,
     materialized_review,
 )
 from oi_agent.opencode.review_target import PROVIDER_GITHUB, PROVIDER_GITLAB, provider_ref_template
 
 _ALLOWED_VERBS = {
-    "archive", "config", "diff", "fetch", "init", "ls-remote", "rev-list", "rev-parse",
+    "cat-file", "config", "diff", "fetch", "init", "ls-remote", "ls-tree", "rev-list", "rev-parse",
 }
 _FORBIDDEN_VERBS = {
-    "add", "am", "apply", "branch", "cherry-pick", "clean", "clone", "commit", "merge",
+    "add", "am", "apply", "archive", "branch", "cherry-pick", "clean", "clone", "commit", "merge",
     "mv", "pull", "push", "rebase", "remote", "reset", "restore", "revert", "rm",
     "stash", "switch", "tag", "update-ref", "worktree",
 }
+_SHA = "b" * 40
 
 
 def _git(*args: str) -> str:
@@ -43,16 +47,45 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
+def _git_input(*args: str, data: bytes) -> str:
+    result = subprocess.run(["git", *args], check=True, capture_output=True, input=data)
+    return result.stdout.decode().strip()
+
+
+def _blob(remote: Path, content: bytes) -> str:
+    """Write one blob into the remote object database and return its SHA."""
+    return _git_input("-C", str(remote), "hash-object", "-w", "--stdin", data=content)
+
+
+def _mktree(remote: Path, lines: list[str]) -> str:
+    """Build one tree object in the remote from ``mode type sha\\tpath`` lines."""
+    data = "".join(line + "\n" for line in lines).encode()
+    return _git_input("-C", str(remote), "mktree", data=data)
+
+
+def _commit_tree(
+    remote: Path, tree: str, message: str, parents: tuple[str, ...] = (),
+) -> str:
+    argv = [
+        "-C", str(remote), "-c", "user.email=t@example.com", "-c", "user.name=Test",
+        "commit-tree", tree, "-m", message,
+    ]
+    for parent in parents:
+        argv += ["-p", parent]
+    return _git(*argv)
+
+
 def _bare_with_mr(
     tmp_path: Path,
     *,
     provider: str = PROVIDER_GITLAB,
     number: int = 188,
+    remote_name: str = "remote.git",
     with_symlinks: bool = False,
     feature_files: int = 0,
 ) -> tuple[Path, Path, str, str]:
     """Create a bare remote with base/head/merge commits and provider refs."""
-    remote = tmp_path / "remote.git"
+    remote = tmp_path / remote_name
     _git("init", "-q", "--bare", str(remote))
     clone = tmp_path / "clone"
     clone.mkdir(parents=True)
@@ -95,11 +128,45 @@ def _set_provider_refs(remote: Path, provider: str, number: int, head: str, merg
     _git("-C", str(remote), "update-ref", provider_ref_template(provider, number, "merge"), merge)
 
 
+def _republish_feature(
+    remote: Path, clone: Path, provider: str = PROVIDER_GITLAB, number: int = 188,
+) -> None:
+    """Commit pending clone changes on feature, re-merge, reset provider refs."""
+    _git("-C", str(clone), "add", "-A")
+    _git("-C", str(clone), "commit", "-qm", "feature update")
+    new_head = _git("-C", str(clone), "rev-parse", "HEAD")
+    _git("-C", str(clone), "push", "-q", "origin", "feature")
+    _git("-C", str(clone), "checkout", "-q", "main")
+    _git("-C", str(clone), "merge", "-q", "--no-ff", "-m", "merge", "feature")
+    new_merge = _git("-C", str(clone), "rev-parse", "HEAD")
+    _git("-C", str(clone), "push", "-q", "origin", "feature", "main")
+    _set_provider_refs(remote, provider, number, new_head, new_merge)
+
+
+def _install_crafted_head(
+    remote: Path, clone: Path, base_sha: str, tree: str,
+    provider: str = PROVIDER_GITLAB, number: int = 188,
+) -> None:
+    """Point the provider refs at a head commit with a hand-crafted tree."""
+    head = _commit_tree(remote, tree, "crafted head")
+    merge = _commit_tree(remote, tree, "merge", parents=(base_sha, head))
+    _set_provider_refs(remote, provider, number, head, merge)
+
+
 def _reviews_glob() -> list[Path]:
     reviews = resolve_opencode_paths().state_home / "reviews"
     if not reviews.exists():
         return []
     return list(reviews.glob("oi-review-*"))
+
+
+def _expect_materialization_rejected(clone: Path, failure: str = "review_extract_rejected") -> None:
+    fingerprint = worktree_fingerprint(clone)
+    with pytest.raises(ReviewSnapshotError) as exc:
+        materialized_review(clone, PROVIDER_GITLAB, 188)
+    assert exc.value.failure_class == failure
+    assert _reviews_glob() == []
+    assert worktree_fingerprint(clone) == fingerprint
 
 
 @pytest.fixture()
@@ -167,18 +234,86 @@ def test_internal_symlink_inside_root_is_allowed(tmp_path: Path, isolated_home: 
     remote, clone, _base, _head = _bare_with_mr(tmp_path)
     _git("-C", str(clone), "checkout", "-q", "feature")
     os.symlink("base.txt", clone / "inside_link")
-    _git("-C", str(clone), "add", "-A")
-    _git("-C", str(clone), "commit", "-qm", "internal link")
-    new_head = _git("-C", str(clone), "rev-parse", "HEAD")
-    _git("-C", str(clone), "push", "-q", "origin", "feature")
-    _git("-C", str(clone), "checkout", "-q", "main")
-    _git("-C", str(clone), "merge", "-q", "--no-ff", "-m", "merge", "feature")
-    new_merge = _git("-C", str(clone), "rev-parse", "HEAD")
-    _git("-C", str(clone), "push", "-q", "origin", "feature", "main")
-    _set_provider_refs(remote, PROVIDER_GITLAB, 188, new_head, new_merge)
+    _republish_feature(remote, clone)
     with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
         link = snapshot.head_dir / "inside_link"
         assert os.readlink(link) == "base.txt"
+
+
+def test_export_ignore_cannot_hide_files_from_snapshot(tmp_path: Path, isolated_home: Path) -> None:
+    """P1-1 regression: export-ignore must not omit a changed file."""
+    remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "checkout", "-q", "feature")
+    (clone / ".gitattributes").write_text("hidden.py export-ignore\n", encoding="utf-8")
+    (clone / "hidden.py").write_text("hidden-canary-content\n", encoding="utf-8")
+    _republish_feature(remote, clone)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        hidden = snapshot.head_dir / "hidden.py"
+        assert hidden.read_text(encoding="utf-8") == "hidden-canary-content\n"
+        assert (snapshot.head_dir / ".gitattributes").exists()
+        statuses = {entry.path: entry.status for entry in snapshot.changed_paths}
+        assert statuses["hidden.py"] == "A"
+
+
+def test_export_subst_cannot_alter_snapshot_bytes(tmp_path: Path, isolated_home: Path) -> None:
+    """P1-1 regression: export-subst must not expand placeholders."""
+    remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "checkout", "-q", "feature")
+    (clone / ".gitattributes").write_text("subst.py export-subst\n", encoding="utf-8")
+    (clone / "subst.py").write_text("$Format:%d$\n", encoding="utf-8")
+    _republish_feature(remote, clone)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        subst = snapshot.head_dir / "subst.py"
+        assert subst.read_text(encoding="utf-8") == "$Format:%d$\n"
+
+
+def test_executable_file_keeps_owner_exec_bit(tmp_path: Path, isolated_home: Path) -> None:
+    remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "checkout", "-q", "feature")
+    (clone / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    os.chmod(clone / "run.sh", 0o755)
+    _republish_feature(remote, clone)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        script = snapshot.head_dir / "run.sh"
+        assert stat.S_IMODE(script.stat().st_mode) == 0o500
+        assert script.read_text(encoding="utf-8") == "#!/bin/sh\n"
+
+
+def test_gitmodules_file_is_materialized(tmp_path: Path, isolated_home: Path) -> None:
+    remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "checkout", "-q", "feature")
+    (clone / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n', encoding="utf-8")
+    _republish_feature(remote, clone)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        modules = snapshot.head_dir / ".gitmodules"
+        assert modules.read_text(encoding="utf-8") == '[submodule "x"]\n\tpath = x\n'
+
+
+def test_head_snapshot_is_complete_against_ls_tree_and_manifest(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    """P1-1 regression: every changed path exists in the head snapshot, and
+    the materialized entry count equals the verified tree's ls-tree count."""
+    remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "checkout", "-q", "feature")
+    (clone / "sub").mkdir()
+    (clone / "sub" / "nested.txt").write_text("n\n", encoding="utf-8")
+    os.symlink("base.txt", clone / "inside_link")
+    _republish_feature(remote, clone)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        listing = subprocess.run(
+            ["git", "-C", str(clone), "ls-tree", "-rz", "--full-tree", snapshot.head_sha],
+            check=True, capture_output=True,
+        ).stdout
+        expected = len([record for record in listing.decode().split("\0") if record])
+        seen = 0
+        for dirpath, _dirnames, filenames in os.walk(snapshot.head_dir):
+            seen += len(filenames)
+        assert seen == expected
+        statuses = {entry.path: entry.status for entry in snapshot.changed_paths}
+        for path, status in statuses.items():
+            if status in ("A", "M"):
+                assert (snapshot.head_dir / path).exists(), path
 
 
 # ==============================================================================
@@ -297,97 +432,264 @@ def test_fetch_timeout_returns_bounded_class_and_cleans_up(
 
 
 # ==============================================================================
-# 4. Safe extraction: real commits and crafted tars
+# 4. Origin URL never appears in process arguments (P2-3)
+# ==============================================================================
+
+def test_origin_url_never_appears_in_process_arguments(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The origin URL (canary remote name) appears in zero argv elements."""
+    remote, clone, _base, _head = _bare_with_mr(
+        tmp_path, remote_name="remote-canary-S3cr3t-token.git",
+    )
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    calls: list[list[str]] = []
+
+    def recording_run(argv: list[str], *args: object, **kwargs: object):
+        calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    def recording_popen(argv: list[str], *args: object, **kwargs: object):
+        calls.append(list(argv))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    with materialized_review(clone, PROVIDER_GITLAB, 188) as snapshot:
+        assert snapshot.head_sha
+    assert calls
+    for argv in calls:
+        for element in argv:
+            assert "S3cr3t-token" not in element
+            assert str(remote) not in element
+    # Networked commands address the remote by NAME, resolved from config.
+    probes = [argv for argv in calls if "ls-remote" in argv]
+    assert probes
+    assert all("origin" in argv for argv in probes)
+
+
+def test_embedded_credential_never_reaches_arguments(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token-bearing https origin stays out of argv even on fetch failure."""
+    _remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    token_url = "https://user:c4nary-t0ken@127.0.0.1:1/repo.git"
+    _git("-C", str(clone), "remote", "set-url", "origin", token_url)
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    calls: list[list[str]] = []
+
+    def recording_run(argv: list[str], *args: object, **kwargs: object):
+        calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    def recording_popen(argv: list[str], *args: object, **kwargs: object):
+        calls.append(list(argv))
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    with pytest.raises(ReviewSnapshotError) as exc:
+        materialized_review(clone, PROVIDER_GITLAB, 188)
+    assert exc.value.failure_class == "review_fetch_failed"
+    assert calls
+    for argv in calls:
+        for element in argv:
+            assert "c4nary-t0ken" not in element
+            assert token_url not in element
+    assert _reviews_glob() == []
+
+
+def test_remote_config_quoting_round_trips(tmp_path: Path) -> None:
+    bare = tmp_path / "quote.git"
+    _git("init", "-q", "--bare", str(bare))
+    url = 'https://user:to"ken@host/repo sp\\ace.git;x#y'
+    assert _write_remote_config(bare, url) is True
+    assert _git("-C", str(bare), "config", "--get", "remote.origin.url") == url
+
+
+def test_remote_config_rejects_line_breaks(tmp_path: Path) -> None:
+    bare = tmp_path / "newline.git"
+    _git("init", "-q", "--bare", str(bare))
+    injection = 'https://host/repo.git\n[remote "evil"]\n\turl = x'
+    assert _write_remote_config(bare, injection) is False
+
+
+def test_origin_with_line_break_fails_closed(tmp_path: Path, isolated_home: Path) -> None:
+    _remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _git("-C", str(clone), "remote", "remove", "origin")
+    _git("-C", str(clone), "config", "remote.origin.url", "https://host/repo.git\nevil")
+    with pytest.raises(ReviewSnapshotError) as exc:
+        materialized_review(clone, PROVIDER_GITLAB, 188)
+    assert exc.value.failure_class == "review_init_failed"
+    assert _reviews_glob() == []
+
+
+# ==============================================================================
+# 5. Safe materialization: crafted trees and path policy (P1-1)
 # ==============================================================================
 
 def test_escaping_symlinks_in_head_are_rejected(tmp_path: Path, isolated_home: Path) -> None:
     _remote, clone, _base, _head = _bare_with_mr(tmp_path, with_symlinks=True)
-    with pytest.raises(ReviewSnapshotError) as exc:
-        materialized_review(clone, PROVIDER_GITLAB, 188)
-    assert exc.value.failure_class == "review_extract_rejected"
-    assert _reviews_glob() == []
+    _expect_materialization_rejected(clone)
 
 
-def _write_tar(path: Path, members: list[tuple[tarfile.TarInfo, bytes | None]]) -> None:
-    with tarfile.open(path, "w") as archive:
-        for info, payload in members:
-            if payload is None:
-                archive.addfile(info)
-            else:
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+@pytest.mark.parametrize(
+    "name",
+    ["../evil", "/abs/evil", ".git/config", ".git", "C:evil", "a\\b", "//evil", "."],
+)
+def test_tree_path_validator_rejects_hostile_names(name: str) -> None:
+    with pytest.raises(ReviewSnapshotError):
+        _validate_tree_path(name)
 
 
-def _file_info(name: str, payload: bytes = b"data", mode: int = 0o644) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name)
-    info.type = tarfile.REGTYPE
-    info.size = len(payload)
-    info.mode = mode
-    return info
+@pytest.mark.parametrize("name", [".gitmodules", ".gitignore", "ok.txt", "sub/file.txt", "..."])
+def test_tree_path_validator_allows_ordinary_names(name: str) -> None:
+    _validate_tree_path(name)
 
 
-def _expect_rejected(tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes | None]]) -> None:
-    tar_path = tmp_path / "crafted.tar"
-    dest = tmp_path / "out"
-    _write_tar(tar_path, members)
-    with pytest.raises(ReviewSnapshotError) as exc:
-        _extract_snapshot_tar(tar_path, dest)
-    assert exc.value.failure_class == "review_extract_rejected"
-    assert not (tmp_path / "evil").exists()
-    assert not (dest / "evil").exists()
+def test_symlink_directory_ancestor_check() -> None:
+    with pytest.raises(ReviewSnapshotError):
+        _reject_symlink_ancestors("d/inner.txt", {"d"})
+    _reject_symlink_ancestors("d/inner.txt", {"other"})
+    _reject_symlink_ancestors("top.txt", {"d"})
 
 
-def test_extract_rejects_parent_traversal(tmp_path: Path) -> None:
-    _expect_rejected(tmp_path, [(_file_info("../evil"), b"pwn")])
+def test_parse_ls_tree_accepts_blob_symlink_and_nested_paths() -> None:
+    entries = review_snapshots._parse_ls_tree(
+        f"100644 blob {_SHA}\ttop.txt\0"
+        f"100755 blob {_SHA}\tsub/run.sh\0"
+        f"120000 blob {_SHA}\tlink\0"
+    )
+    assert [(entry.path, entry.executable, entry.is_symlink) for entry in entries] == [
+        ("top.txt", False, False),
+        ("sub/run.sh", True, False),
+        ("link", False, True),
+    ]
 
 
-def test_extract_rejects_absolute_path(tmp_path: Path) -> None:
-    _expect_rejected(tmp_path, [(_file_info("/abs/evil"), b"pwn")])
+def test_parse_ls_tree_rejects_submodule_entry() -> None:
+    with pytest.raises(ReviewSnapshotError):
+        review_snapshots._parse_ls_tree(f"160000 commit {_SHA}\tsub\0")
 
 
-def test_extract_rejects_windows_drive_path(tmp_path: Path) -> None:
-    _expect_rejected(tmp_path, [(_file_info("C:evil"), b"pwn")])
+def test_parse_ls_tree_rejects_unusual_mode() -> None:
+    with pytest.raises(ReviewSnapshotError):
+        review_snapshots._parse_ls_tree(f"100664 blob {_SHA}\tf.txt\0")
 
 
-def test_extract_rejects_git_directory_entry(tmp_path: Path) -> None:
-    _expect_rejected(tmp_path, [(_file_info(".git/config"), b"pwn")])
+def test_parse_ls_tree_rejects_record_without_path() -> None:
+    with pytest.raises(ReviewSnapshotError):
+        review_snapshots._parse_ls_tree(f"100644 blob {_SHA}\0")
 
 
-def test_extract_rejects_hardlink(tmp_path: Path) -> None:
-    info = tarfile.TarInfo("evil")
-    info.type = tarfile.LNKTYPE
-    info.linkname = "base.txt"
-    _expect_rejected(tmp_path, [(info, None)])
+def test_parse_ls_tree_rejects_malformed_object_sha() -> None:
+    with pytest.raises(ReviewSnapshotError):
+        review_snapshots._parse_ls_tree("100644 blob zzz\tf.txt\0")
 
 
-def test_extract_rejects_device_node(tmp_path: Path) -> None:
-    info = tarfile.TarInfo("evil")
-    info.type = tarfile.CHRTYPE
-    info.devmajor = 1
-    info.devminor = 3
-    _expect_rejected(tmp_path, [(info, None)])
+def test_crafted_tree_with_dotdot_path_is_rejected(tmp_path: Path, isolated_home: Path) -> None:
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    blob = _blob(remote, b"pwn")
+    tree = _mktree(remote, [f"100644 blob {blob}\tok.txt", f"100644 blob {blob}\t.."])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
 
 
-def test_extract_rejects_setuid_file(tmp_path: Path) -> None:
-    _expect_rejected(tmp_path, [(_file_info("evil", mode=0o4755), b"pwn")])
+def test_crafted_tree_with_windows_drive_path_is_rejected(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    blob = _blob(remote, b"pwn")
+    tree = _mktree(remote, [f"100644 blob {blob}\tC:evil"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
 
 
-def test_extract_rejects_absolute_symlink(tmp_path: Path) -> None:
-    info = tarfile.TarInfo("evil")
-    info.type = tarfile.SYMTYPE
-    info.linkname = "/etc/passwd"
-    _expect_rejected(tmp_path, [(info, None)])
+def test_crafted_tree_with_backslash_path_is_rejected(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    blob = _blob(remote, b"pwn")
+    tree = _mktree(remote, ["100644 blob " + blob + "\ta" + chr(92) + "b"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
 
 
-def test_extract_rejects_escaping_relative_symlink(tmp_path: Path) -> None:
-    info = tarfile.TarInfo("sub/evil")
-    info.type = tarfile.SYMTYPE
-    info.linkname = "../../etc/passwd"
-    _expect_rejected(tmp_path, [(info, None)])
+def test_crafted_tree_with_git_entry_is_rejected(tmp_path: Path, isolated_home: Path) -> None:
+    """A symlink whose target enters .git is rejected (blob content is free-form)."""
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    blob = _blob(remote, b"hooks")
+    target = _blob(remote, b".git/hooks")
+    tree = _mktree(remote, [f"100644 blob {blob}\tok.txt", f"120000 blob {target}\tevil"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
+
+
+def test_crafted_tree_with_absolute_symlink_is_rejected(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    target = _blob(remote, b"/etc/passwd")
+    tree = _mktree(remote, [f"120000 blob {target}\tevil"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
+
+
+def test_crafted_tree_with_escaping_symlink_is_rejected(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    target = _blob(remote, b"../../outside")
+    sub = _mktree(remote, [f"120000 blob {target}\tevil"])
+    tree = _mktree(remote, [f"040000 tree {sub}\tsub"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
+
+
+def test_crafted_tree_with_submodule_entry_is_rejected(
+    tmp_path: Path, isolated_home: Path,
+) -> None:
+    """A 160000 commit entry fails the whole materialization."""
+    remote, clone, base_sha, _head = _bare_with_mr(tmp_path)
+    gitlink = _commit_tree(remote, _mktree(remote, [f"100644 blob {_blob(remote, b'x')}\tf"]), "sub")
+    blob = _blob(remote, b"pwn")
+    tree = _mktree(remote, [f"100644 blob {blob}\tok.txt", f"160000 commit {gitlink}\tsub"])
+    _install_crafted_head(remote, clone, base_sha, tree)
+    _expect_materialization_rejected(clone)
 
 
 # ==============================================================================
-# 5. Cleanup on exception, close, and garbage collection
+# 6. Streaming size limits (P2-4)
+# ==============================================================================
+
+def test_single_blob_over_cap_is_rejected(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_snapshots, "MAX_SINGLE_BLOB_BYTES", 2)
+    _remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _expect_materialization_rejected(clone, "review_snapshot_too_large")
+
+
+def test_total_bytes_over_cap_is_rejected(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_snapshots, "MAX_SNAPSHOT_TOTAL_BYTES", 6)
+    _remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _expect_materialization_rejected(clone, "review_snapshot_too_large")
+
+
+def test_file_count_over_cap_is_rejected(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(review_snapshots, "MAX_SNAPSHOT_FILES", 1)
+    _remote, clone, _base, _head = _bare_with_mr(tmp_path)
+    _expect_materialization_rejected(clone, "review_snapshot_too_large")
+
+
+# ==============================================================================
+# 7. Cleanup on exception, close, and garbage collection
 # ==============================================================================
 
 def test_cleanup_after_exception_in_body(tmp_path: Path, isolated_home: Path) -> None:
@@ -423,7 +725,7 @@ def test_garbage_collection_finalizer_cleans_up(tmp_path: Path, isolated_home: P
 
 
 # ==============================================================================
-# 6. Git argv discipline: read-only verbs only
+# 8. Git argv discipline: read-only verbs only
 # ==============================================================================
 
 def test_only_readonly_git_commands_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -454,6 +756,7 @@ def test_only_readonly_git_commands_run(tmp_path: Path, monkeypatch: pytest.Monk
     assert verbs, "expected recorded git activity"
     assert not (set(verbs) - _ALLOWED_VERBS), sorted(set(verbs) - _ALLOWED_VERBS)
     assert set(verbs).isdisjoint(_FORBIDDEN_VERBS)
+    assert "cat-file" in verbs and "ls-tree" in verbs
     # The only config access is the read-only origin lookup.
     for argv in calls:
         if "config" in argv:

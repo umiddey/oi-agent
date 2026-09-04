@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -177,10 +178,19 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
             pass
 
 
+# Dict-derived error classes are embedded verbatim in Discord-bound failure
+# text (finding P1-2), so each candidate must be a bounded enum-like
+# identifier: no whitespace, newlines, control characters, or path/URL syntax.
+_ERROR_CLASS_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
 def _error_class(event: dict[str, Any]) -> str:
     """Classify an error event without returning its potentially sensitive body.
 
-    Dict payloads contribute only their short enum-like ``name``/``type``.
+    Dict payloads contribute only their short enum-like ``name``/``type``:
+    a candidate is used only when it is a string fully matching
+    ``[A-Za-z0-9_.-]{1,64}``; otherwise the next candidate is tried and, when
+    none validates, the payload collapses to ``opencode_error``.
     Plain-string payloads are unbounded harness diagnostics: the only signal
     kept is the ``session`` substring (``unknown_session``); everything else
     collapses to the bounded constant ``opencode_error`` so no raw harness
@@ -188,7 +198,10 @@ def _error_class(event: dict[str, Any]) -> str:
     """
     err = event.get("error") or event.get("data")
     if isinstance(err, dict):
-        return str(err.get("name") or err.get("type") or "opencode_error")
+        for candidate in (err.get("name"), err.get("type")):
+            if isinstance(candidate, str) and _ERROR_CLASS_PATTERN.fullmatch(candidate):
+                return candidate
+        return "opencode_error"
     if isinstance(err, str):
         if "session" in err.lower():
             return "unknown_session"

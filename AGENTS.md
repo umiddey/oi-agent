@@ -29,6 +29,15 @@ uv pip install -e . --force-reinstall --no-deps
   roots, an inline native `agent.oi`, and no `--auto`.
 - Native permissions allow only repository-scoped `read`, `glob`, `grep`, `list`,
   and `lsp`; edit/bash/web/MCP/skill/task/question/external access is denied.
+- Only the final completed OpenCode assistant message is deliverable;
+  intermediate narration and reasoning never reach the outbox or Discord.
+- MR/PR references resolve only against configured watched repositories.
+  Controller-side MR fetching is read-only and limited to configured
+  repositories (`ls-remote`/`fetch` plus bounded `ls-tree`/`cat-file`/`diff`)
+  using provider-owned refs and temporary snapshots that are never persisted.
+  Unsupported, ambiguous, or unresolved references fail honestly and never fall back to auditing the
+  current checkout. Review provenance carries exact full base/head SHAs, and
+  review sessions are never resumed or stored under a conversation key.
 - Never log prompts, repository evidence, replies, model reasoning, credentials,
   or raw JSONL events. Bounded metadata only.
 - Posting is gated by the channel allowlist + per-channel hourly cap + kill

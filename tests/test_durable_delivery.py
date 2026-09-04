@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import stat
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +27,9 @@ import pytest
 
 from oi_agent.agent.reply import Reply
 from oi_agent.config import Config, WatchTarget
+from oi_agent.opencode.paths import resolve_opencode_paths
+from oi_agent.opencode.provenance import worktree_fingerprint
+from oi_agent.opencode.review_target import provider_ref_template
 from oi_agent.poster import DeliveryResult
 from oi_agent.store import Store
 from oi_agent.watch import discord_client
@@ -32,7 +39,7 @@ from oi_agent.watch.discord_client import OIWatcher
 class FakeAuthor:
     """Minimal Discord author object."""
 
-    def __init__(self, user_id: int, name: str = "user1", bot: bool = False) -> None:
+    def __init__(self, user_id: int, name: str = "alice", bot: bool = False) -> None:
         """Initialize author attributes.
 
         Args:
@@ -984,3 +991,269 @@ async def test_guild_watch_reflection_stores_under_guild_scope(tmp_path: Path, m
     assert any(p.handle == "guildie" for p in snapshot.profiles)
     assert store.memory_snapshot("discord", "777").is_empty
     store.close()
+
+
+# --- Final-only output at the Discord boundary (plan Phase 6 regression) ---------
+#
+# A real Discord review showed OpenCode's intermediate narration ("Let me
+# check...", tool commentary) concatenated with the answer and posted. These
+# tests pin the full path: fake OpenCode binary -> OpenCodeRunner -> outbox ->
+# Poster, using the exact pinned synthetic stream structure (several assistant
+# narration messages plus one completed final message).
+
+
+def _committed_repo(tmp_path: Path) -> Path:
+    """Create a minimal committed git fixture for the watched checkout."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "marker.txt").write_text("UNIQUE_MARKER\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "marker.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    return repo
+
+
+def _spam_opencode_script(
+    tmp_path: Path, narration_lines: list[str], final_parts: list[str]
+) -> Path:
+    """Fake OpenCode emitting narration messages plus one multi-part final answer."""
+    session = "sess-spam"
+    stream: list[dict[str, object]] = []
+    part_index = 0
+    for step, narration in enumerate(narration_lines):
+        message = f"msg_narration_{step}"
+        part = {"id": f"p{part_index}", "messageID": message,
+                "sessionID": session, "type": "step-start"}
+        stream.append({"type": "step_start", "timestamp": 0, "sessionID": session, "part": part})
+        part_index += 1
+        part = {"id": f"p{part_index}", "messageID": message,
+                "sessionID": session, "type": "text", "text": narration}
+        stream.append({"type": "text", "timestamp": 0, "sessionID": session, "part": part})
+        part_index += 1
+        part = {"id": f"p{part_index}", "messageID": message, "sessionID": session,
+                "type": "tool", "tool": "read", "callID": f"call-{step}",
+                "state": {"status": "completed", "input": {}, "output": ""}}
+        stream.append({"type": "tool_use", "timestamp": 0, "sessionID": session, "part": part})
+        part_index += 1
+        part = {"id": f"p{part_index}", "messageID": message,
+                "sessionID": session, "type": "step-finish", "reason": "tool-calls"}
+        stream.append({"type": "step_finish", "timestamp": 0, "sessionID": session, "part": part})
+        part_index += 1
+    message = "msg_final"
+    part = {"id": f"p{part_index}", "messageID": message,
+            "sessionID": session, "type": "step-start"}
+    stream.append({"type": "step_start", "timestamp": 0, "sessionID": session, "part": part})
+    part_index += 1
+    for final_text in final_parts:
+        part = {"id": f"p{part_index}", "messageID": message,
+                "sessionID": session, "type": "text", "text": final_text}
+        stream.append({"type": "text", "timestamp": 0, "sessionID": session, "part": part})
+        part_index += 1
+    part = {"id": f"p{part_index}", "messageID": message,
+            "sessionID": session, "type": "step-finish", "reason": "stop"}
+    stream.append({"type": "step_finish", "timestamp": 0, "sessionID": session, "part": part})
+
+    body = f"""#!{sys.executable}
+import json, sys
+for event in {stream!r}:
+    print(json.dumps(event))
+"""
+    path = tmp_path / "fake-opencode-spam"
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _bare_remote_with_mr(
+    tmp_path: Path, *, provider: str = "gitlab", number: int = 188
+) -> tuple[Path, Path, str, str]:
+    """Create a bare remote and watched clone with synthetic provider MR refs."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    clone = _committed_repo(tmp_path)
+    subprocess.run(["git", "-C", str(clone), "remote", "add", "origin", str(remote)], check=True)
+    base_sha = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(clone), "checkout", "-q", "-b", "feature"], check=True)
+    (clone / "marker.txt").write_text("HEAD_MARKER\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(clone), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-qm", "head"], check=True)
+    head_sha = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(clone), "checkout", "-q", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "merge", "-q", "--no-ff", "-m", "merge result", "feature"],
+        check=True,
+    )
+    merge_sha = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "main", "feature"], check=True)
+    subprocess.run(
+        ["git", "-C", str(remote), "update-ref",
+         provider_ref_template(provider, number, "head"), head_sha],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(remote), "update-ref",
+         provider_ref_template(provider, number, "merge"), merge_sha],
+        check=True,
+    )
+    return remote, clone, base_sha, head_sha
+
+
+def _reviews_glob() -> list[Path]:
+    reviews = resolve_opencode_paths().state_home / "reviews"
+    if not reviews.exists():
+        return []
+    return list(reviews.glob("oi-review-*"))
+
+
+def _collapse(text: str) -> str:
+    """Whitespace-normalized form for chunk-boundary-insensitive comparison."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _outbox_rows(store: Store) -> list[tuple[str, int, str | None]]:
+    return store._conn.execute(
+        "SELECT batch_id, chunk_index, body FROM outbound_chunks ORDER BY batch_id, chunk_index"
+    ).fetchall()
+
+
+@pytest.mark.asyncio
+async def test_final_only_reply_reaches_outbox_and_discord(tmp_path: Path, monkeypatch) -> None:
+    """Narration from a multi-step stream never reaches the outbox or Discord.
+
+    Regression for the historical failure where every assistant text event was
+    concatenated: the outbox must hold exactly the one bounded final answer
+    before delivery confirmation, delivered chunks must reconstruct it in
+    order, and bodies must be scrubbed after confirmation.
+    """
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
+    repo = _committed_repo(tmp_path)
+    audited_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    narration = ["Let me check the repository now.", "Narrowing the answer down."]
+    final_body = "VERIFIED_FINAL_BEGIN " + ("A verified conclusion sentence. " * 90) + "FINAL_ANSWER_END"
+    binary = _spam_opencode_script(tmp_path, narration, [final_body])
+    expected_text = f"{final_body}\n\n-# audited at {audited_sha}"
+
+    cfg = Config()
+    cfg.watches = [WatchTarget(111, str(repo), 99, 10)]
+    cfg.opencode_binary = str(binary)
+    cfg.max_reply_chars = 5000  # force Discord transport chunking of one logical reply
+    store = Store(tmp_path / "state.db")
+    watcher = OIWatcher(cfg, store)
+    watcher._reflection_engine.reflect_after_delivery = AsyncMock(return_value=None)
+
+    channel = FakeChannel(111)
+    message = FakeMessage(1701, channel, FakeAuthor(7), "<@99> audit this", [FakeMention(99)])
+    channel._history = [message]
+
+    delivered: list[str] = []
+    bodies_seen_at_delivery: list[list[str | None]] = []
+
+    async def fake_deliver(self, channel_id, target_channel_id, chunk, nonce,
+                           reply_to_message_id=None, client=None):
+        # Before any delivery confirmation the outbox already holds the full
+        # logical reply and nothing else.
+        bodies_seen_at_delivery.append([body for _b, _i, body in _outbox_rows(store)])
+        delivered.append(chunk)
+        return DeliveryResult(ok=True, discord_message_id=5000 + len(delivered))
+
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+
+    await watcher.on_message(message)
+    for _ in range(200):
+        if store.get_queue_stats().get("done_jobs") == 1:
+            break
+        await asyncio.sleep(0.05)
+    await watcher.close()
+
+    assert store.get_opencode_session(111, repo) is not None  # the audit itself succeeded
+    # Only the final answer was delivered, in order, split purely for transport.
+    assert len(delivered) == 2
+    for chunk in delivered:
+        assert len(chunk) <= 2000
+    assert _collapse(" ".join(delivered)) == _collapse(expected_text)
+    for line in narration:
+        for chunk in delivered:
+            assert line not in chunk
+    # Pre-confirmation snapshot: all chunk bodies present, exactly the answer.
+    assert len(bodies_seen_at_delivery) == 2
+    pre_confirmation = bodies_seen_at_delivery[0]
+    assert all(body is not None for body in pre_confirmation)
+    assert _collapse(" ".join(pre_confirmation)) == _collapse(expected_text)
+    for body in pre_confirmation:
+        for line in narration:
+            assert line not in body
+    # After delivery confirmation the bodies are scrubbed...
+    rows = _outbox_rows(store)
+    assert len(rows) == 2
+    assert all(body is None for _b, _i, body in rows)
+    # ...and exactly one completed batch exists.
+    batches = store._conn.execute("SELECT status FROM delivery_batches").fetchall()
+    assert batches == [("done",)]
+
+
+@pytest.mark.asyncio
+async def test_mr_review_final_only_through_outbox_and_discord(tmp_path: Path, monkeypatch) -> None:
+    """An MR review delivers only the final review text with exact MR provenance.
+
+    Covers the review path end to end: explicit reference admission, controller
+    snapshots, narration-stripped reply, outbox lifecycle with scrubbing,
+    review-session isolation, snapshot cleanup, and an untouched worktree.
+    """
+    monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    _remote, clone, base_sha, head_sha = _bare_remote_with_mr(tmp_path)
+    fingerprint = worktree_fingerprint(clone)
+    narration = ["Let me check the merge request now.", "Comparing both snapshots."]
+    final_body = "REVIEW_VERDICT: the proposed change is acceptable."
+    binary = _spam_opencode_script(tmp_path, narration, [final_body])
+    expected_text = f"{final_body}\n\n-# audited at MR !188 base {base_sha} head {head_sha}"
+
+    cfg = Config()
+    cfg.watches = [WatchTarget(111, str(clone), 99, 10)]
+    cfg.opencode_binary = str(binary)
+    store = Store(tmp_path / "state.db")
+    watcher = OIWatcher(cfg, store)
+    watcher._reflection_engine.reflect_after_delivery = AsyncMock(return_value=None)
+
+    channel = FakeChannel(111)
+    message = FakeMessage(1801, channel, FakeAuthor(7), "<@99> review MR 188", [FakeMention(99)])
+    channel._history = [message]
+
+    delivered: list[str] = []
+    bodies_seen_at_delivery: list[list[str | None]] = []
+
+    async def fake_deliver(self, channel_id, target_channel_id, chunk, nonce,
+                           reply_to_message_id=None, client=None):
+        bodies_seen_at_delivery.append([body for _b, _i, body in _outbox_rows(store)])
+        delivered.append(chunk)
+        return DeliveryResult(ok=True, discord_message_id=6000 + len(delivered))
+
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+
+    await watcher.on_message(message)
+    for _ in range(200):
+        if store.get_queue_stats().get("done_jobs") == 1:
+            break
+        await asyncio.sleep(0.05)
+    await watcher.close()
+
+    # Exactly one chunk: the bounded final review with MR provenance footer.
+    assert delivered == [expected_text]
+    assert bodies_seen_at_delivery == [[expected_text]]
+    # Review sessions are never stored, so nothing can be resumed.
+    assert store.get_opencode_session(111, clone) is None
+    # Outbox scrubbed after confirmation; snapshots gone; worktree untouched.
+    assert all(body is None for _b, _i, body in _outbox_rows(store))
+    assert _reviews_glob() == []
+    assert worktree_fingerprint(clone) == fingerprint

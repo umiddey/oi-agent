@@ -144,8 +144,16 @@ with open(trace, "w", encoding="utf-8") as handle:
                "env_home": os.environ.get("HOME", ""),
                "xdg_config": os.environ.get("XDG_CONFIG_HOME", ""),
                "disable": os.environ.get("OPENCODE_DISABLE_PROJECT_CONFIG")}}, handle)
-print(json.dumps({{"type": "text", "sessionID": "session-123",
-                  "part": {{"text": "UNIQUE_MARKER"}}}}))
+part = {{"id": "p2", "messageID": "msg-1", "sessionID": "session-123",
+        "type": "text", "text": "UNIQUE_MARKER"}}
+print(json.dumps({{"type": "step_start", "timestamp": 0, "sessionID": "session-123",
+                  "part": {{"id": "p1", "messageID": "msg-1",
+                           "sessionID": "session-123", "type": "step-start"}}}}))
+print(json.dumps({{"type": "text", "timestamp": 0, "sessionID": "session-123", "part": part}}))
+print(json.dumps({{"type": "step_finish", "timestamp": 0, "sessionID": "session-123",
+                  "part": {{"id": "p3", "messageID": "msg-1",
+                           "sessionID": "session-123", "type": "step-finish",
+                           "reason": "stop"}}}}))
 '''
     path = tmp_path / name
     path.write_text(body, encoding="utf-8")
@@ -194,13 +202,13 @@ def test_memory_block_is_parseable_json_between_markers(tmp_path):
     """Memory renders as parseable JSON strictly between BEGIN/END markers."""
     store = Store(tmp_path / "state.db")
     store.upsert_member_profile(
-        "discord", "s1", "u1", "member1", _stored_profile(topics=("python", "runner"))
+        "discord", "s1", "u1", "umid", _stored_profile(topics=("python", "runner"))
     )
     prompt = build_prompt(
         "Engineer", primary_repo="/repo", memory=store.memory_snapshot("discord", "s1")
     )
     block = _memory_block(prompt)
-    assert block["members"][0]["handle"] == "member1"
+    assert block["members"][0]["handle"] == "umid"
     assert block["members"][0]["detail"] == "brief"
     assert block["members"][0]["recurring_topics"] == ["python", "runner"]
     # Immutable safety sections still come AFTER the untrusted block.
@@ -546,7 +554,7 @@ async def test_guild_watch_memory_scope_round_trip(tmp_path, monkeypatch):
     watcher._reflection_worker_task = asyncio.create_task(watcher._reflection_worker_loop())
 
     msg1 = _FakeMessage(
-        9001, channel, _FakeAuthor(1001, "member1"), "<@99> check the runner",
+        9001, channel, _FakeAuthor(1001, "umid"), "<@99> check the runner",
         [_FakeMention(99)],
     )
     channel._history.append(msg1)
@@ -562,7 +570,7 @@ async def test_guild_watch_memory_scope_round_trip(tmp_path, monkeypatch):
 
     # Store.memory_snapshot for the GUILD scope returns the profile (round trip).
     snapshot = store.memory_snapshot("discord", "555")
-    assert any(p.handle == "member1" for p in snapshot.profiles)
+    assert any(p.handle == "umid" for p in snapshot.profiles)
     assert store.memory_snapshot("discord", "777").is_empty
 
     # Second delivery in the SAME guild renders the stored profile in the prompt
@@ -570,7 +578,7 @@ async def test_guild_watch_memory_scope_round_trip(tmp_path, monkeypatch):
     binary2, trace2 = _fake_opencode(tmp_path, "oc-guild-run-2")
     cfg.opencode_binary = str(binary2)
     msg2 = _FakeMessage(
-        9002, channel, _FakeAuthor(1001, "member1"), "<@99> run it again",
+        9002, channel, _FakeAuthor(1001, "umid"), "<@99> run it again",
         [_FakeMention(99)],
     )
     channel._history.append(msg2)
@@ -582,7 +590,7 @@ async def test_guild_watch_memory_scope_round_trip(tmp_path, monkeypatch):
     assert trace2.exists()
     prompt2 = _prompt_from_trace(trace2)
     assert _BEGIN in prompt2
-    assert '"handle":"member1"' in prompt2
+    assert '"handle":"umid"' in prompt2
 
     await watcher.close()
     store.close()
@@ -597,8 +605,8 @@ async def test_participant_scoped_memory_excludes_other_members(tmp_path, monkey
     monkeypatch.setenv("HOME", str(tmp_path / "operator"))
     repo = _git_repo(tmp_path)
     store = Store(tmp_path / "state.db")
-    store.upsert_member_profile("discord", "1", "u1", "user1_p", _stored_profile())
-    store.upsert_member_profile("discord", "1", "u2", "user2_other", _stored_profile())
+    store.upsert_member_profile("discord", "1", "u1", "alice_p", _stored_profile())
+    store.upsert_member_profile("discord", "1", "u2", "bob_other", _stored_profile())
 
     cfg = Config(opencode_model="provider/model", opencode_timeout_seconds=10)
     runner = OpenCodeRunner(cfg, store)
@@ -606,18 +614,18 @@ async def test_participant_scoped_memory_excludes_other_members(tmp_path, monkey
 
     binary1, trace1 = _fake_opencode(tmp_path, "oc-participant")
     cfg.opencode_binary = str(binary1)
-    reply = await runner.run(target, "user1_p", "question", "", member_id="u1")
+    reply = await runner.run(target, "alice_p", "question", "", member_id="u1")
     assert reply.ok is True
     prompt1 = _prompt_from_trace(trace1)
-    assert '"handle":"user1_p"' in prompt1
-    assert '"handle":"user2_other"' not in prompt1
+    assert '"handle":"alice_p"' in prompt1
+    assert '"handle":"bob_other"' not in prompt1
 
     # Unknown member id keeps the scope-wide behavior.
     binary2, trace2 = _fake_opencode(tmp_path, "oc-scope-wide")
     cfg.opencode_binary = str(binary2)
-    reply2 = await runner.run(target, "user1_p", "question", "")
+    reply2 = await runner.run(target, "alice_p", "question", "")
     assert reply2.ok is True
     prompt2 = _prompt_from_trace(trace2)
-    assert '"handle":"user1_p"' in prompt2
-    assert '"handle":"user2_other"' in prompt2
+    assert '"handle":"alice_p"' in prompt2
+    assert '"handle":"bob_other"' in prompt2
     store.close()

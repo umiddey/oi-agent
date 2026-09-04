@@ -22,6 +22,9 @@ tool loop, repository manifest, or skill integration.
 
 ## Safety model
 
+- Only the final completed OpenCode assistant message is deliverable.
+  Intermediate narration, reasoning, and partial assistant steps never reach
+  the outbox or Discord, and reply truncation preserves the provenance footer.
 - Git remotes remain read-scoped. OI may run
   `git pull --ff-only --autostash` to refresh a watched clone; OpenCode cannot
   edit source files or execute shell commands.
@@ -39,6 +42,32 @@ tool loop, repository manifest, or skill integration.
   an atomic per-channel hourly cap, and honors the global `oi pause` switch.
 - Logs contain bounded metadata only: no prompts, repository evidence, replies,
   reasoning, credentials, or raw OpenCode events.
+
+## Merge request reviews
+
+An explicit `MR 188` / `!188` (GitLab) or `PR 188` / `pull request 188`
+(GitHub) reference, or a canonical merge-request URL, in the latest request
+triggers a read-only merge-request audit instead of the watched-checkout
+audit. Bare numbers (`188`) and `#188`-style references are deliberately
+treated as ordinary text: only the explicit forms above trigger a review.
+
+- References resolve only against configured watched repositories. A bare
+  number must match exactly one of them; ambiguous, unavailable, unsupported,
+  or malformed references fail with an actionable message and never fall back
+  to auditing the current branch.
+- Controller-side MR fetching is read-only (`ls-remote` and `fetch` on
+  provider-owned refs, then bounded `ls-tree`, `cat-file`, and `diff`) and
+  limited to the configured repository's `origin`. It verifies the base/head
+  relationship and materializes temporary read-only base/head snapshots.
+- The model receives only those snapshot directories through the existing
+  read-only file tools. Permissions remain read-only file inspection with no
+  Git, shell, web, MCP, or credential access; `.git` and secret files stay
+  denied.
+- Review provenance carries the exact full base and head SHAs, e.g.
+  `MR !188 base <sha> head <sha>`, and survives reply truncation. Review runs
+  never resume or store conversation sessions.
+- Temporary snapshots and object repositories are removed after every run —
+  success, failure, timeout, or cancellation — and are never persisted.
 
 ## Quick start
 

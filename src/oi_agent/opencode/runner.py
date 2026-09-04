@@ -22,7 +22,7 @@ from ..config import Config, WatchTarget
 from .bootstrap import resolve_binary
 from .paths import resolve_opencode_paths
 from .policy import build_agent_config
-from .prompt import build_prompt
+from .prompt import FINAL_OUTPUT_MARKER, build_prompt
 from .provenance import audit_sha, git_pull, mutation_warning, worktree_fingerprint
 from .review_snapshots import ReviewSnapshot, ReviewSnapshotError, materialized_review
 from .review_target import (
@@ -347,6 +347,15 @@ def _select_final_text(
             return fail("protocol_incomplete_final")
     return fail("protocol_no_final_message")
 
+def _extract_marked_answer(text: str) -> tuple[str, str | None]:
+    """Return only the explicitly framed user-facing answer."""
+    if text.count(FINAL_OUTPUT_MARKER) != 1:
+        return "", "protocol_missing_final_marker"
+    answer = text.rsplit(FINAL_OUTPUT_MARKER, 1)[1].strip()
+    if not answer:
+        return "", "protocol_empty_final_answer"
+    return answer, None
+
 
 def _failure(sha: str, error_class: str) -> Reply:
     """Build the honest failure reply without exposing subprocess diagnostics."""
@@ -625,7 +634,9 @@ class OpenCodeRunner:
             events, _ = stdout_task.result()
             text, _, selection_error, _ = _select_final_text(events)
             if selection_error is None and text:
-                return text
+                text, marker_error = _extract_marked_answer(text)
+                if marker_error is None:
+                    return text
             return None
         except asyncio.CancelledError:
             # Cancellation must not orphan the start_new_session process group.
@@ -744,6 +755,9 @@ class OpenCodeRunner:
         )
         text, returned_session, event_error, text_parts = _select_final_text(events)
         error_class = error_class or event_error
+        if error_class is None:
+            text, marker_error = _extract_marked_answer(text)
+            error_class = marker_error
         if error_class is None and not text:
             error_class = "empty_response"
 
@@ -981,6 +995,9 @@ class OpenCodeRunner:
             )
             text, _, event_error, text_parts = _select_final_text(events)
             error_class = error_class or event_error
+            if error_class is None:
+                text, marker_error = _extract_marked_answer(text)
+                error_class = marker_error
             if error_class is None and not text:
                 error_class = "empty_response"
             logger.info(

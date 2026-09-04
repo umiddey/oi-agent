@@ -137,7 +137,7 @@ def _create_mock_opencode(tmp_path: Path, mutate_repo: Path | None = None) -> Pa
 import json, sys
 {mutate_snippet}
 part = {{"id": "p2", "messageID": "msg-1", "sessionID": "sess-multi",
-        "type": "text", "text": "Multi-repo audit completed"}}
+        "type": "text", "text": "[[OI_FINAL_ANSWER]]\\nMulti-repo audit completed"}}
 print(json.dumps({{"type": "step_start", "timestamp": 0, "sessionID": "sess-multi",
                   "part": {{"id": "p1", "messageID": "msg-1",
                            "sessionID": "sess-multi", "type": "step-start"}}}}))

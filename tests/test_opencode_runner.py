@@ -12,6 +12,7 @@ import pytest
 
 from oi_agent.config import Config, WatchTarget
 from oi_agent.opencode.paths import resolve_opencode_paths
+from oi_agent.opencode.prompt import FINAL_OUTPUT_MARKER
 from oi_agent.opencode.provenance import worktree_fingerprint
 from oi_agent.opencode.review_target import provider_ref_template
 from oi_agent.opencode.runner import (
@@ -66,10 +67,13 @@ def _tool_step(msg, narration_part_id, narration):
     ]
 
 
-def _final_step(msg, parts, reason="stop", finish=True):
+def _final_step(msg, parts, reason="stop", finish=True, marked=False):
     """Final assistant message: start, text parts, then its completion marker."""
     stream = [_event("step_start", _part("step-start", msg, msg + "-s"))]
+    first_part_id = parts[0][0] if parts else None
     for part_id, text in parts:
+        if marked and part_id == first_part_id:
+            text = f"{FINAL_OUTPUT_MARKER}\n{text}"
         stream.append(_event("text", _part("text", msg, part_id, text=text)))
     if finish:
         stream.append(_event("step_finish", _part("step-finish", msg, msg + "-f",
@@ -78,11 +82,12 @@ def _final_step(msg, parts, reason="stop", finish=True):
 
 
 def _pinned_stream(final_parts, final_reason="stop", finish_final=True):
-    """Canonical narration -> tool -> narration -> final answer pinned stream."""
+    """Canonical narration -> tool -> narration -> marked final answer stream."""
     stream = _tool_step("msg_narration_a", "tx1", "Checking the repository now.")
     stream += _tool_step("msg_narration_b", "tx2", "Narrowing the answer down.")
     return stream + _final_step("msg_final", final_parts,
-                                reason=final_reason, finish=finish_final)
+                                reason=final_reason, finish=finish_final,
+                                marked=True)
 
 
 _ERROR_EVENT = {"type": "error", "timestamp": 1, "sessionID": SESSION,
@@ -112,7 +117,8 @@ _STREAMS = {
         _event("step_start", _part("step-start", "msg_final", "s9")),
         _event("reasoning", _part("reasoning", "msg_final", "r1",
                                   text="REASONING_MARKER")),
-        _event("text", _part("text", "msg_final", "p9", text="UNIQUE_MARKER")),
+        _event("text", _part("text", "msg_final", "p9",
+                             text=f"{FINAL_OUTPUT_MARKER}\nUNIQUE_MARKER")),
         _event("step_finish", _part("step-finish", "msg_final", "f9",
                                     reason="stop")),
     ],
@@ -140,6 +146,23 @@ _STREAMS = {
     ],
     "hostile_name_error": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [
         _LEAK_NAME_ERROR_EVENT,
+    ],
+    "unframed_planning": [
+        _event("step_start", _part("step-start", "msg_final", "s9")),
+        _event(
+            "text",
+            _part(
+                "text",
+                "msg_final",
+                "p9",
+                text="The latest question is essentially the same as before. "
+                "I've already gathered the evidence. Let me be punchier this time.",
+            ),
+        ),
+        _event(
+            "step_finish",
+            _part("step-finish", "msg_final", "f9", reason="stop"),
+        ),
     ],
     "post_finish_text": _pinned_stream([("p9", "UNIQUE_MARKER")]) + [
         _event("text", _part("text", "msg_final", "late", text="SMUGGLED")),
@@ -254,6 +277,22 @@ async def test_runner_reasoning_parts_never_reach_reply(tmp_path, monkeypatch):
     assert reply.ok is True
     assert reply.text.startswith("UNIQUE_MARKER")
     assert "REASONING_MARKER" not in reply.text
+
+@pytest.mark.asyncio
+async def test_unframed_planning_is_never_delivered(tmp_path, monkeypatch):
+    """A stop-completed planning block fails closed instead of being posted."""
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    repo = _repo(tmp_path)
+    binary, _ = _script(tmp_path, "unframed_planning")
+    cfg = Config(opencode_binary=str(binary), opencode_model="provider/model")
+
+    reply = await OpenCodeRunner(cfg).run(
+        WatchTarget(1, str(repo)), "alice", "question", ""
+    )
+
+    assert reply.ok is False
+    assert reply.error_class == "protocol_missing_final_marker"
+    assert "The latest question is essentially" not in reply.text
 
 
 @pytest.mark.asyncio
@@ -1146,7 +1185,7 @@ try:
 except OSError:
     base_value = "MISSING"
 final = {{"id": "rf", "messageID": "msg_final", "sessionID": "session-123",
-        "type": "text", "text": "HEAD_VALUE=" + head_value + " BASE_VALUE=" + base_value}}
+        "type": "text", "text": "[[OI_FINAL_ANSWER]]\\nHEAD_VALUE=" + head_value + " BASE_VALUE=" + base_value}}
 print(json.dumps({{"type": "step_start", "timestamp": 0, "sessionID": "session-123",
                   "part": {{"id": "rs", "messageID": "msg_final",
                            "sessionID": "session-123", "type": "step-start"}}}}))

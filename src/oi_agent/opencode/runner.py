@@ -459,39 +459,23 @@ def _truncate_cut(text: str, limit: int) -> int:
     return limit
 
 
-def _bounded_text(text: str, sha: str, cap: int) -> str:
-    """Apply the reply cap while preserving the provenance footer.
-
-    ``cap`` covers the whole reply including the footer. When truncation is
-    necessary the text is cut at the cleanest boundary that fits, and an
-    explicit truncation marker is inserted before the footer so provenance
-    always stays intact and mid-word cuts only happen when no boundary exists.
+def _bounded_text(text: str, cap: int) -> str:
+    """Apply the configured reply cap without adding metadata.
 
     Args:
         text: Selected final assistant text.
-        sha: Audited repository SHA for the footer.
         cap: Total reply character cap.
 
     Returns:
-        Bounded reply text with footer, within ``cap`` when possible. Only
-        when ``cap`` itself is smaller than the footer — unreachable via
-        validated config (``max_reply_chars >= 200``) — is the footer
-        truncated to ``cap`` as a documented last resort.
+        Bounded reply text with a clean truncation boundary when possible.
     """
-    footer = f"\n\n-# audited at {sha}"
-    if len(text) + len(footer) <= cap:
-        return f"{text}{footer}".strip()
-    body_cap = cap - len(footer) - len(TRUNCATION_MARKER)
+    if len(text) <= cap:
+        return text.strip()
+    body_cap = cap - len(TRUNCATION_MARKER)
     if body_cap <= 0:
-        # Degenerate cap: drop the body first and keep the provenance footer
-        # intact whenever the cap can hold it; only a cap below the footer
-        # itself (unreachable via validated config) may truncate the footer.
-        bounded = footer.strip()
-        if cap < len(bounded):
-            bounded = bounded[:cap]
-        return bounded
+        return text[:cap]
     cut = _truncate_cut(text, body_cap)
-    return f"{text[:cut].rstrip()}{TRUNCATION_MARKER}{footer}".strip()
+    return f"{text[:cut].rstrip()}{TRUNCATION_MARKER}".strip()
 
 
 class OpenCodeRunner:
@@ -785,7 +769,7 @@ class OpenCodeRunner:
         if error_class:
             return _failure(final_combined_sha, error_class)
         return Reply(
-            text=_bounded_text(text, final_combined_sha, self._cfg.max_reply_chars),
+            text=_bounded_text(text, self._cfg.max_reply_chars),
             sha=final_combined_sha,
             ok=True,
             session_id=returned_session,
@@ -1007,10 +991,9 @@ class OpenCodeRunner:
             )
             if error_class:
                 return _review_failure(error_class, sha=provenance)
-            # Provenance flows through the same bounded-text footer so the
-            # exact base/head SHAs survive truncation; no session is stored.
+            # Provenance remains in the structured Reply.sha field, not chat text.
             return Reply(
-                text=_bounded_text(text, provenance, self._cfg.max_reply_chars),
+                text=_bounded_text(text, self._cfg.max_reply_chars),
                 sha=provenance,
                 ok=True,
                 session_id=None,

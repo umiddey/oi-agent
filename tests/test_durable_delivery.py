@@ -1129,23 +1129,13 @@ def _outbox_rows(store: Store) -> list[tuple[str, int, str | None]]:
 
 @pytest.mark.asyncio
 async def test_final_only_reply_reaches_outbox_and_discord(tmp_path: Path, monkeypatch) -> None:
-    """Narration from a multi-step stream never reaches the outbox or Discord.
-
-    Regression for the historical failure where every assistant text event was
-    concatenated: the outbox must hold exactly the one bounded final answer
-    before delivery confirmation, delivered chunks must reconstruct it in
-    order, and bodies must be scrubbed after confirmation.
-    """
+    """Narration from a multi-step stream never reaches the outbox or Discord."""
     monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
     repo = _committed_repo(tmp_path)
-    audited_sha = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
     narration = ["Let me check the repository now.", "Narrowing the answer down."]
     final_body = "VERIFIED_FINAL_BEGIN " + ("A verified conclusion sentence. " * 90) + "FINAL_ANSWER_END"
     binary = _spam_opencode_script(tmp_path, narration, [final_body])
-    expected_text = f"{final_body}\n\n-# audited at {audited_sha}"
+    expected_text = final_body
 
     cfg = Config()
     cfg.watches = [WatchTarget(111, str(repo), 99, 10)]
@@ -1207,12 +1197,7 @@ async def test_final_only_reply_reaches_outbox_and_discord(tmp_path: Path, monke
 
 @pytest.mark.asyncio
 async def test_mr_review_final_only_through_outbox_and_discord(tmp_path: Path, monkeypatch) -> None:
-    """An MR review delivers only the final review text with exact MR provenance.
-
-    Covers the review path end to end: explicit reference admission, controller
-    snapshots, narration-stripped reply, outbox lifecycle with scrubbing,
-    review-session isolation, snapshot cleanup, and an untouched worktree.
-    """
+    """An MR review delivers only the final review text."""
     monkeypatch.setattr(discord_client, "BURST_QUIET_SECONDS", 0)
     monkeypatch.setenv("HOME", str(tmp_path / "operator"))
     _remote, clone, base_sha, head_sha = _bare_remote_with_mr(tmp_path)
@@ -1220,7 +1205,7 @@ async def test_mr_review_final_only_through_outbox_and_discord(tmp_path: Path, m
     narration = ["Let me check the merge request now.", "Comparing both snapshots."]
     final_body = "REVIEW_VERDICT: the proposed change is acceptable."
     binary = _spam_opencode_script(tmp_path, narration, [final_body])
-    expected_text = f"{final_body}\n\n-# audited at MR !188 base {base_sha} head {head_sha}"
+    expected_text = final_body
 
     cfg = Config()
     cfg.watches = [WatchTarget(111, str(clone), 99, 10)]
@@ -1251,7 +1236,7 @@ async def test_mr_review_final_only_through_outbox_and_discord(tmp_path: Path, m
         await asyncio.sleep(0.05)
     await watcher.close()
 
-    # Exactly one chunk: the bounded final review with MR provenance footer.
+    # Exactly one chunk: the bounded final review text.
     assert delivered == [expected_text]
     assert bodies_seen_at_delivery == [[expected_text]]
     # Review sessions are never stored, so nothing can be resumed.

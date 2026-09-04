@@ -297,6 +297,20 @@ def _migrate_legacy_rows(
 
 
 
+def _ensure_schema_compatibility(conn: sqlite3.Connection) -> None:
+    """Apply additive migrations required by the current SQLite schema."""
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(member_profiles_v2)").fetchall()
+    }
+    if "created_at" not in columns:
+        conn.execute(
+            "ALTER TABLE member_profiles_v2 "
+            "ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("UPDATE member_profiles_v2 SET created_at=updated_at")
+
+
 class Store:
     """Synchronous SQLite wrapper for daemon safety state and durable delivery queues."""
 
@@ -309,10 +323,10 @@ class Store:
         Returns:
             None: No return value.
         """
-        db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, timeout=10, isolation_level=None)
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        _ensure_schema_compatibility(self._conn)
 
     def close(self) -> None:
         """Close the SQLite connection.

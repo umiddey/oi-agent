@@ -9,6 +9,37 @@ from concurrent.futures import ThreadPoolExecutor
 from oi_agent.store import Store
 
 
+def test_existing_profile_schema_gets_additive_created_at_migration(tmp_path):
+    """Existing v2 databases gain the column required by current profile writes."""
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE member_profiles_v2 (
+            platform TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_interaction_at INTEGER NOT NULL,
+            PRIMARY KEY (platform, scope_id, member_id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db)
+    columns = {
+        row[1]
+        for row in store._conn.execute("PRAGMA table_info(member_profiles_v2)")
+    }
+    assert "created_at" in columns
+    assert store.get_memory_status("discord", "scope")["member_profiles_count"] == 0
+    store.close()
+
+
 def test_pause_and_hourly_cap_roundtrip(tmp_path):
     """Pause state and per-channel reservations remain durable."""
     store = Store(tmp_path / "state.db")

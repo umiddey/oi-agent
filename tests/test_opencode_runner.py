@@ -238,7 +238,6 @@ async def test_runner_uses_argv_stdin_isolated_env_and_final_text(tmp_path, monk
     assert reply.text.startswith("UNIQUE_MARKER")
     assert "Checking the repository now." not in reply.text
     assert "Narrowing the answer down." not in reply.text
-    assert "audited at " in reply.text
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     assert trace["argv"] == [
         "run", "--format", "json", "--model", "provider/model",
@@ -632,73 +631,56 @@ async def test_runner_leaking_dict_error_name_never_reaches_reply(tmp_path, monk
         assert fragment not in (reply.error_class or "")
     assert "UNIQUE_MARKER" not in reply.text
 
-def test_reply_cap_preserves_audit_footer():
-    """Long model text is bounded without dropping provenance."""
-    text = _bounded_text("x" * 1000, "abc1234", 200)
+def test_reply_cap_drops_metadata():
+    """Long model text is bounded without appending provenance metadata."""
+    text = _bounded_text("x" * 1000, 200)
     assert len(text) <= 200
-    assert text.endswith("-# audited at abc1234")
+    assert text.endswith("[reply truncated]")
 
 
 def test_bounded_text_prefers_paragraph_boundary():
     """Paragraph boundaries win even when a later sentence end would fit."""
-    sha = "abc1234"
     para1 = "First paragraph stands alone."
     second = "Second para. "
     text = para1 + "\n\n" + second + "y" * 400
-    body_cap = len(para1) + 2 + len(second)
-    cap = body_cap + len("\n\n[reply truncated]") + len(f"\n\n-# audited at {sha}")
-    out = _bounded_text(text, sha, cap)
+    cap = len(para1) + len("\n\n[reply truncated]")
+    out = _bounded_text(text, cap)
     assert out.startswith(para1)
     assert "Second para" not in out
     assert "[reply truncated]" in out
-    assert out.endswith(f"-# audited at {sha}")
     assert len(out) <= cap
 
 
 def test_bounded_text_falls_back_to_sentence_boundary():
     """Without paragraph boundaries the last fitting sentence end is used."""
-    sha = "abc1234"
     body = "One sentence ends here. Another ends there. " + "z" * 400
-    cap = 120
-    out = _bounded_text(body, sha, cap)
+    out = _bounded_text(body, 120)
     assert out.startswith("One sentence ends here. Another ends there.")
     assert "zzz" not in out
     assert "[reply truncated]" in out
-    assert out.endswith(f"-# audited at {sha}")
-    assert len(out) <= cap
+    assert len(out) <= 120
 
 
-def test_bounded_text_char_fallback_only_without_boundaries():
-    """A boundary-free text is cut at the cap with marker and footer intact."""
-    sha = "abc1234"
-    out = _bounded_text("q" * 500, sha, 200)
-    assert "\n\n[reply truncated]\n\n-# audited at " + sha in out
-    assert out.endswith("-# audited at " + sha)
+def test_bounded_text_char_fallback_without_metadata():
+    """A boundary-free text is cut at the cap with only a truncation marker."""
+    out = _bounded_text("q" * 500, 200)
+    assert "\n\n[reply truncated]" in out
+    assert out.endswith("[reply truncated]")
     assert len(out) <= 200
     assert out.startswith("qqq")
 
 
 def test_bounded_text_within_cap_keeps_no_marker():
-    """Text already inside the cap gains the footer but no truncation marker."""
-    out = _bounded_text("short answer", "abc1234", 200)
-    assert out == "short answer\n\n-# audited at abc1234"
+    """Text already inside the cap is returned unchanged."""
+    out = _bounded_text("short answer", 200)
+    assert out == "short answer"
     assert "[reply truncated]" not in out
 
 
-def test_bounded_text_degenerate_cap_drops_body_keeps_footer():
-    """A cap below footer+marker drops the body but never cuts the footer."""
-    sha = "abc1234"
-    footer = f"\n\n-# audited at {sha}"
-    cap = len(footer)  # smaller than footer + truncation marker, holds the footer
-    out = _bounded_text("BODY_TEXT" * 100, sha, cap)
-    assert out == f"-# audited at {sha}"
-    assert len(out) <= cap
-
-
-def test_bounded_text_cap_below_footer_is_last_resort():
-    """Only a cap smaller than the footer itself may truncate the footer."""
-    out = _bounded_text("BODY_TEXT" * 100, "abc1234", 10)
-    assert out == "-# audited"
+def test_bounded_text_degenerate_cap_truncates_body():
+    """A cap smaller than the truncation marker returns the bounded prefix."""
+    out = _bounded_text("BODY_TEXT" * 100, 10)
+    assert out == "BODY_TEXTB"
     assert len(out) == 10
 
 @pytest.mark.asyncio
@@ -961,7 +943,6 @@ async def test_runner_mr_review_audits_snapshots_with_mr_provenance(tmp_path, mo
     assert reply.sha == f"MR !188 base {base_sha} head {head_sha}"
     assert reply.text.startswith("UNIQUE_MARKER")
     assert "Checking the repository now." not in reply.text  # narration dropped
-    assert f"-# audited at MR !188 base {base_sha} head {head_sha}" in reply.text
 
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     argv = trace["argv"]
@@ -977,8 +958,10 @@ async def test_runner_mr_review_audits_snapshots_with_mr_provenance(tmp_path, mo
     assert policy["webfetch"] == "deny"
     ext = policy["external_directory"]
     assert ext["*"] == "deny"
-    assert ext[str(base_dir)] == "allow"  # base snapshot explicitly authorized
+    assert ext[str(base_dir)] == "allow"
+    assert ext[f"{base_dir}/**"] == "allow"
     stdin = trace["stdin"]
+    assert reply.text == "UNIQUE_MARKER"
     assert base_sha in stdin and head_sha in stdin
     assert "MR !188" in stdin
     assert "M base.txt" in stdin and "A head.txt" in stdin
@@ -1007,7 +990,6 @@ async def test_runner_pr_review_reports_github_provenance(tmp_path, monkeypatch)
     assert reply.ok is True
     assert reply.session_id is None
     assert reply.sha == f"PR #188 base {base_sha} head {head_sha}"
-    assert f"PR #188 base {base_sha} head {head_sha}" in reply.text
     stdin = json.loads(trace_path.read_text(encoding="utf-8"))["stdin"]
     assert "PR #188" in stdin
 
@@ -1226,7 +1208,6 @@ async def test_runner_mr_review_reads_defect_from_head_and_base_snapshots(
     assert "HEAD_VALUE=THRESHOLD = 999999" in reply.text
     assert "BASE_VALUE=THRESHOLD = 42" in reply.text
     assert "MISSING" not in reply.text
-    assert f"-# audited at MR !188 base {base_sha} head {head_sha}" in reply.text
     assert _reviews_glob() == []
     assert worktree_fingerprint(clone) == fingerprint
 

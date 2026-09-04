@@ -291,7 +291,6 @@ EVIDENCE CONTRACT:
 - Search before asserting details; inspect relevant source and tests, not just filenames.
 - Distinguish observed facts, reasonable inferences, and unknowns.
 - Mention relevant limitations such as stale pulls, dirty worktrees, or incomplete evidence.
-- Include the exact audited SHA in the answer as `audited at <sha>`.
 - Do not claim to have changed files, run commands, contacted Discord, or used tools
   that were not actually available and exercised.
 

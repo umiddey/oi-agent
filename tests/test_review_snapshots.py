@@ -14,6 +14,7 @@ import gc
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -686,6 +687,23 @@ def test_file_count_over_cap_is_rejected(
     monkeypatch.setattr(review_snapshots, "MAX_SNAPSHOT_FILES", 1)
     _remote, clone, _base, _head = _bare_with_mr(tmp_path)
     _expect_materialization_rejected(clone, "review_snapshot_too_large")
+
+@pytest.mark.parametrize("method", ["read_exact", "read_to_eof"])
+def test_subprocess_pipe_reads_obey_deadline(method: str) -> None:
+    """A silent subprocess pipe cannot block snapshot work indefinitely."""
+    read_fd, write_fd = os.pipe()
+    started = time.monotonic()
+    try:
+        with os.fdopen(read_fd, "rb", buffering=0) as stream:
+            reader = review_snapshots._DeadlineReader(
+                stream, 0.01, "review_tree_failed",
+            )
+            with pytest.raises(ReviewSnapshotError) as exc:
+                getattr(reader, method)(1)
+        assert exc.value.failure_class == "review_tree_failed"
+        assert time.monotonic() - started < 0.5
+    finally:
+        os.close(write_fd)
 
 
 # ==============================================================================

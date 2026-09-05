@@ -250,6 +250,36 @@ async def test_stale_session_is_cleared_and_retried_once(
 
 
 @pytest.mark.asyncio
+async def test_protocol_failure_without_session_is_retried_once(tmp_path, monkeypatch):
+    """A protocol failure without stored session still gets one fresh retry."""
+    watcher = _watcher(tmp_path)
+    target = watcher._cfg.watches[0]
+    channel = FakeChannel(111)
+    message = FakeMessage(1, channel, FakeAuthor(7), "<@99> explain this", [FakeMention(99)])
+    channel._history = [message]
+    session_args = []
+
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+        """Fail once without a stored session, then succeed."""
+        session_args.append(session_id)
+        if len(session_args) == 1:
+            return Reply("failure", "sha", ok=False, error_class="protocol_empty_final_answer")
+        return Reply("answer", "sha", session_id="fresh")
+
+    async def fake_deliver(self, *args, **kwargs):
+        """Accept the recovered post."""
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await watcher.on_message(message)
+    await asyncio.sleep(0.05)
+
+    assert session_args == [None, None]
+    assert watcher._store.get_opencode_session(111, target.repo_path) == "fresh"
+
+
+@pytest.mark.asyncio
 async def test_thread_sessions_are_separated_from_parent_channel(tmp_path, monkeypatch):
     """Thread conversation stores its OpenCode session under thread ID."""
     watcher = _watcher(tmp_path, channel_id=111)

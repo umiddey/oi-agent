@@ -491,7 +491,8 @@ def _make_fake_engine(record, result=None, error=None):
         now also exercises the genuine engine as a belt-and-braces check.
         """
 
-        def __init__(self, runner_obj, store_obj):
+        def __init__(self, runner_obj, store_obj, **kwargs):
+            record["analysis_timeout"] = kwargs.get("analysis_timeout")
             record["engine_constructed"] += 1
 
         async def analyze_history(self, platform, scope_id, messages, *,
@@ -649,7 +650,7 @@ def test_bootstrap_yes_collects_chronological_history_with_exclusions(tmp_path, 
     assert "empty-excluded=1" in result.output
     assert "permission-failed=0" in result.output
     assert "Initialized 3 member profile(s)" in result.output
-    assert record["max_messages"] == 120  # bounded analysis batch, not collection cap
+    assert record["max_messages"] == 60  # bounded analysis batch, not collection cap
     assert record["stores"] and record["stores"][0].closed
 
 
@@ -747,7 +748,7 @@ def test_bootstrap_reads_all_explicit_channels_without_collection_cap(tmp_path, 
     ])
     assert result.exit_code == 0, result.output
     assert len(record["messages"]) == 12  # 2 messages from all 6 channels
-    assert record["max_messages"] == 120
+    assert record["max_messages"] == 60
     assert "channels=6, threads=0, collected=12" in result.output
     assert channels[5].history_calls == 1
 

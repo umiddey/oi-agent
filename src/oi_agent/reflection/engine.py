@@ -178,11 +178,16 @@ class _ValidatedPlan:
 
 class ReflectionEngine:
     """Asynchronously reflects on conversations to evolve team dynamics and agent persona."""
-
-    def __init__(self, runner: OpenCodeRunner, store: Store) -> None:
+    def __init__(
+        self,
+        runner: OpenCodeRunner,
+        store: Store,
+        *,
+        analysis_timeout: int = 90,
+    ) -> None:
         self._runner = runner
         self._store = store
-
+        self._analysis_timeout = analysis_timeout
     # --- helpers -----------------------------------------------------------------
 
     async def _run_model(
@@ -560,7 +565,7 @@ Output a single JSON object with these sections (strict schema, no extra markdow
         raw = await self._run_model(
             prompt,
             system_prompt="You are a team dynamics analysis agent. Output valid JSON only.",
-            timeout=90,
+            timeout=self._analysis_timeout,
             scope_hash="-",
         )
         if raw is None:

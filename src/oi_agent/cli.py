@@ -328,8 +328,8 @@ def resume(config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c")) -
 
 
 BOOTSTRAP_MAX_MESSAGE_CHARS = DISCORD_MAX_MESSAGE_CHARS
-ANALYSIS_BATCH_MAX_MESSAGES = 120
-ANALYSIS_BATCH_MAX_CHARS = 120_000
+ANALYSIS_BATCH_MAX_MESSAGES = 60
+ANALYSIS_BATCH_MAX_CHARS = 60_000
 
 
 def _configured_bootstrap_channels(target: WatchTarget) -> list[int] | None:
@@ -516,7 +516,9 @@ def bootstrap_cmd(
 
     store = Store(Path(cfg.db_path).expanduser())
     runner = OpenCodeRunner(cfg, store)
-    engine = ReflectionEngine(runner, store)
+    engine = ReflectionEngine(
+        runner, store, analysis_timeout=cfg.opencode_timeout_seconds
+    )
 
     async def _run_bootstrap() -> dict:
         """Discover sources, collect all permitted history, and analyze batches."""

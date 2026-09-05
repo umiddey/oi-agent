@@ -541,9 +541,14 @@ def bootstrap_cmd(
             "channel_count": 0,
             "thread_count": 0,
         }
+        bootstrap_started = False
 
         @client.event
         async def on_ready() -> None:
+            nonlocal bootstrap_started
+            if bootstrap_started:
+                return
+            bootstrap_started = True
             channels_to_scan: list = []
             skipped_channels: list[int] = []
             guild = None

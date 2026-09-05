@@ -465,7 +465,9 @@ def test_prompt_useful_with_empty_memory():
         assert _BEGIN not in prompt
         assert "ANTI-AI CHAT CADENCE & RESPONSE RULES" in prompt
         assert "NON-NEGOTIABLE SAFETY" in prompt
-        assert "EVIDENCE CONTRACT" in prompt
+        assert "EVIDENCE AND GUIDANCE CONTRACT" in prompt
+        assert "General technical or operational questions may receive useful general guidance" in prompt
+        assert "This marker is mandatory even when" in prompt
 
 
 # --- B1 regression: canonical guild scope round trip through _run_locked -----------

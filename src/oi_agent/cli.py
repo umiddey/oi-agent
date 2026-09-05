@@ -327,9 +327,9 @@ def resume(config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c")) -
     console.print("[green]resumed[/green]")
 
 
-BOOTSTRAP_MAX_CHANNELS = 5
-# Per-message collection bound for bootstrap; reuses the existing Discord char limit.
 BOOTSTRAP_MAX_MESSAGE_CHARS = DISCORD_MAX_MESSAGE_CHARS
+ANALYSIS_BATCH_MAX_MESSAGES = 120
+ANALYSIS_BATCH_MAX_CHARS = 120_000
 
 
 def _configured_bootstrap_channels(target: WatchTarget) -> list[int] | None:
@@ -351,26 +351,19 @@ def _stdin_isatty() -> bool:
     return sys.stdin.isatty()
 
 
-def _print_dynamic_set_alternatives(target: WatchTarget, max_channels: int, *, third: str) -> None:
+def _print_dynamic_set_alternatives(target: WatchTarget, *, third: str) -> None:
     """Print actionable alternatives for a dynamic (unresolved) channel set."""
     console.print("Choose one:")
     console.print(
-        f"  1. configure allowed-channels on the watch target "
+        "  1. configure allowed-channels on the watch target "
         f"(`oi config watch-add --guild-id {target.guild_id} --allowed-channels <ids>`)"
     )
-    console.print(
-        f"  2. pass --channels <id,id,...> with the exact IDs for this run (max {max_channels})"
-    )
+    console.print("  2. pass --channels <id,id,...> with the exact IDs for this run")
     console.print(f"  3. {third}")
 
 
 def _parse_explicit_channels(raw: str) -> list[int]:
-    """Parse a --channels value into a deduplicated, capped list of numeric IDs.
-
-    Fail-closed on empty or non-numeric input. Duplicates are removed in order
-    and more than ``BOOTSTRAP_MAX_CHANNELS`` IDs are capped to the first
-    ``BOOTSTRAP_MAX_CHANNELS`` so a run never exceeds the advertised bound.
-    """
+    """Parse a --channels value into a deduplicated list of numeric IDs."""
     ids: list[int] = []
     for part in raw.split(","):
         part_str = part.strip()
@@ -390,122 +383,89 @@ def _parse_explicit_channels(raw: str) -> list[int]:
     if not ids:
         console.print("[red]--channels requires at least one numeric channel ID[/red]")
         raise typer.Exit(1)
-    deduped = list(dict.fromkeys(ids))
-    if len(deduped) > BOOTSTRAP_MAX_CHANNELS:
-        capped = deduped[:BOOTSTRAP_MAX_CHANNELS]
-        console.print(
-            f"[yellow]--channels capped to the first {BOOTSTRAP_MAX_CHANNELS} IDs: "
-            f"{', '.join(str(c) for c in capped)}[/yellow]"
-        )
-        deduped = capped
-    return deduped
+    return list(dict.fromkeys(ids))
 
 
 @app.command("bootstrap")
 def bootstrap_cmd(
     scope: str = typer.Option(..., "--scope", "-s", help="Configured watch scope ID (channel ID or guild ID)."),
-    limit: int = typer.Option(25, "--limit", "-l", help="Max messages per channel (max 50)."),
+    limit: int | None = typer.Option(
+        None, "--limit", "-l",
+        help="Optional per-source message limit; omitted means all available history.",
+    ),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="Preview target scope/channels without reading or persisting."
+        False, "--dry-run", help="Preview target channels without reading or persisting."
     ),
     yes: bool = typer.Option(
         False, "--yes", "-y",
-        help=(
-            "Non-interactive consent to analyze history. Valid only for an exact channel "
-            "set (channel watch, configured allowed-channels, or --channels); a dynamic "
-            "channel set fails closed with exit 1 before any connection."
-        ),
+        help="Non-interactive consent for an exact configured channel set and all discoverable threads beneath it.",
     ),
     channels_opt: str | None = typer.Option(
         None, "--channels",
-        help=(
-            "Comma-separated exact channel IDs for this run; only valid for guild watches"
-            " without a configured allowed-channels list. IDs must be numeric, duplicates"
-            " are removed, and the list is capped at the first 5 IDs. With --channels,"
-            " consent covers exactly these IDs and --yes may run non-interactively."
-        ),
+        help="Comma-separated exact channel IDs for this run; only valid for unrestricted guild watches.",
     ),
     config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c"),
 ) -> None:
-    """Bootstrap member profiles and team pulse from recent channel history with explicit consent.
+    """Bootstrap guild memory from every permitted channel and discoverable thread.
 
-    Consent is exact-known-channel. The consent matrix:
-
-    - Exact channel set (channel watch, guild watch with a configured
-      allowed-channels list, or explicit --channels): --yes runs
-      non-interactively with zero prompts; interactive runs without --yes
-      confirm once before connecting; non-interactive runs without --yes
-      fail closed.
-    - Dynamic channel set (guild watch without configured allowed-channels
-      and without --channels): --yes fails closed immediately with exit 1,
-      before any connection or setup, because --yes can never authorize an
-      unresolved channel set; interactive runs without --yes connect
-      read-only, display the resolved channel IDs with bounds, and require a
-      second confirmation (default No) before any history is read, and
-      declining aborts cleanly with exit code 0; non-interactive runs fail
-      closed before any connection.
-    - --dry-run never connects and only previews the intended scope.
-
-    No prompt is ever reachable when --yes is passed, regardless of tty state.
+    Collection has no channel or total-message cap. Each model call remains
+    bounded by ``ReflectionEngine.analyze_history`` and is processed as a
+    chronological batch. Raw history is discarded after each batch.
     """
     import asyncio
 
     cfg = _load_or_die(config)
-    target = None
-    for t in cfg.watches:
-        t_scope = str(t.guild_id if t.is_guild_watch else t.channel_id)
-        if t_scope == str(scope):
-            target = t
-            break
+    target = next(
+        (
+            item for item in cfg.watches
+            if str(item.guild_id if item.is_guild_watch else item.channel_id) == str(scope)
+        ),
+        None,
+    )
     if target is None:
         console.print(f"[red]scope {scope!r} is not in configured watches[/red]")
         raise typer.Exit(1)
-
-    bounded_limit = max(1, min(limit, 50))
-    max_channels = BOOTSTRAP_MAX_CHANNELS
-    max_total_msgs = bounded_limit * max_channels
+    if limit is not None and limit <= 0:
+        console.print("[red]--limit must be a positive integer when provided[/red]")
+        raise typer.Exit(1)
 
     explicit_channels: list[int] | None = None
     if channels_opt is not None:
         if not target.is_guild_watch or target.allowed_channels:
-            console.print(
-                "[red]--channels applies only to guild watches without a configured "
-                "allowed-channels list (this watch's exact channel set is already known)[/red]"
-            )
+            console.print("[red]--channels applies only to unrestricted guild watches[/red]")
             raise typer.Exit(1)
         explicit_channels = _parse_explicit_channels(channels_opt)
-
     configured_channels = (
         explicit_channels
         if explicit_channels is not None
         else _configured_bootstrap_channels(target)
     )
     dynamic_set = configured_channels is None
+    limit_text = str(limit) if limit is not None else "all available"
 
     console.print(f"[bold]Bootstrap Scope:[/bold] {scope} (is_guild_watch={target.is_guild_watch})")
     if dynamic_set:
         console.print(
-            f"[bold]Channels:[/bold] up to {max_channels} guild text channels "
-            f"(dynamic set: exact IDs resolve at connect and are re-confirmed before "
-            f"any history read; ignored={target.ignored_channels or []})"
+            "[bold]Channels:[/bold] every accessible guild text channel "
+            f"(dynamic set; ignored={target.ignored_channels or []})"
         )
     else:
         listed = ", ".join(str(c) for c in configured_channels) or "none"
         console.print(f"[bold]Channels ({len(configured_channels)}):[/bold] {listed}")
     console.print(
-        f"[bold]Bounds:[/bold] max {bounded_limit} msgs/channel, "
-        f"{max_total_msgs} messages total (enforced before analysis)"
+        f"[bold]History:[/bold] {limit_text} messages per channel/thread; "
+        "analysis is processed in bounded batches"
     )
     console.print(
         "[bold]Retention:[/bold] extracted observations are stored in SQLite; "
-        "raw message text is discarded immediately."
+        "raw message text is discarded after each analysis batch."
     )
 
     if dry_run:
         if dynamic_set:
             console.print(
-                "[yellow]channel set is dynamic: exact channel IDs resolve at connect "
-                "time (ignored channels excluded), so this preview cannot list them.[/yellow]"
+                "[yellow]channel and thread sets resolve after connecting; "
+                "dry-run does not fetch them.[/yellow]"
             )
         console.print("[green]dry-run enabled: no history fetched, no model called, no memory written.[/green]")
         return
@@ -514,43 +474,32 @@ def bootstrap_cmd(
     if dynamic_set and not interactive:
         console.print(
             "[red]cannot run non-interactively: this guild watch has no configured "
-            "allowed-channels list, so the exact channel IDs to read cannot be known "
-            "before connecting and cannot be consented to.[/red]"
+            "allowed-channels list.[/red]"
         )
         _print_dynamic_set_alternatives(
-            target, max_channels,
-            third="run interactively (tty) to review the resolved channels before confirming",
+            target,
+            third="run interactively (tty) to review channels and discoverable threads",
         )
         raise typer.Exit(1)
-
     if dynamic_set and yes:
-        # --yes means non-interactive pre-consent. It can never authorize a
-        # channel set that is only resolvable after connecting, so fail closed
-        # immediately: no prompt may be reachable with --yes regardless of tty.
         console.print(
-            "[red]--yes cannot consent to a dynamic channel set: this guild watch has no "
-            "configured allowed-channels list, so the exact channel IDs to read are only "
-            "known after connecting.[/red]"
+            "[red]--yes cannot consent to an unresolved guild channel set; "
+            "configure allowed channels or pass --channels.[/red]"
         )
         _print_dynamic_set_alternatives(
-            target, max_channels,
-            third=(
-                "rerun interactively (tty) WITHOUT --yes to review the resolved "
-                "channels and confirm before any history read"
-            ),
+            target,
+            third="rerun interactively (tty) WITHOUT --yes",
         )
         raise typer.Exit(1)
-
     if not yes:
         if not interactive:
             console.print("[red]non-interactive execution requires --yes consent flag[/red]")
             raise typer.Exit(1)
-        confirmed = Prompt.ask(
-            "Proceed with reading channel history and synthesizing team memory?",
+        if Prompt.ask(
+            "Proceed with reading channel/thread history and synthesizing team memory?",
             choices=["y", "n"],
             default="n",
-        ) == "y"
-        if not confirmed:
+        ) != "y":
             console.print("[yellow]bootstrap aborted by operator[/yellow]")
             return
 
@@ -563,8 +512,6 @@ def bootstrap_cmd(
     import discord
 
     from .opencode.runner import OpenCodeRunner
-
-    # Pinned contract (PIN-A): HistoryMessage + analyze_history live in reflection.engine.
     from .reflection.engine import HistoryMessage, ReflectionEngine
 
     store = Store(Path(cfg.db_path).expanduser())
@@ -572,7 +519,7 @@ def bootstrap_cmd(
     engine = ReflectionEngine(runner, store)
 
     async def _run_bootstrap() -> dict:
-        """Collect bounded chronological history, then run scoped analysis."""
+        """Discover sources, collect all permitted history, and analyze batches."""
         intents = discord.Intents.default()
         intents.messages = True
         intents.message_content = True
@@ -584,59 +531,96 @@ def bootstrap_cmd(
             "bot_excluded": 0,
             "system_excluded": 0,
             "empty_excluded": 0,
-            "collected": [],
+            "collected": 0,
+            "analysis_batches": 0,
             "analysis": None,
             "analysis_error": "",
+            "member_ids": set(),
             "declined": False,
             "skipped_channels": [],
+            "channel_count": 0,
+            "thread_count": 0,
         }
 
         @client.event
         async def on_ready() -> None:
             channels_to_scan: list = []
             skipped_channels: list[int] = []
+            guild = None
             if target.is_guild_watch:
                 guild = discord.utils.get(client.guilds, id=target.guild_id)
                 if guild is None:
                     outcome["guild_missing"] = True
-                elif configured_channels is not None:
-                    # Exact IDs were consented to pre-connect (configured list or
-                    # --channels): resolve each one and skip/report the rest.
-                    for cid in configured_channels:
-                        ch_obj = discord.utils.get(getattr(guild, "text_channels", []), id=cid)
-                        if ch_obj is not None and target.matches_channel(ch_obj.id, target.guild_id):
-                            channels_to_scan.append(ch_obj)
-                        else:
-                            skipped_channels.append(cid)
-                else:
-                    for c in getattr(guild, "text_channels", []):
-                        if target.matches_channel(c.id, target.guild_id):
-                            channels_to_scan.append(c)
+                    await client.close()
+                    return
+                candidates = (
+                    [
+                        discord.utils.get(getattr(guild, "text_channels", []), id=cid)
+                        for cid in configured_channels or []
+                    ]
+                    if configured_channels is not None
+                    else list(getattr(guild, "text_channels", []))
+                )
+                for channel in candidates:
+                    if channel is not None and target.matches_channel(channel.id, target.guild_id):
+                        channels_to_scan.append(channel)
+                    elif channel is not None:
+                        skipped_channels.append(channel.id)
             else:
-                ch = client.get_channel(target.channel_id)
-                if ch is None:
+                channel = client.get_channel(target.channel_id)
+                if channel is None:
                     try:
-                        ch = await client.fetch_channel(target.channel_id)
+                        channel = await client.fetch_channel(target.channel_id)
                     except Exception:
                         outcome["permission_failures"] += 1
-                if ch is not None:
-                    channels_to_scan = [ch]
+                if channel is not None:
+                    channels_to_scan = [channel]
 
-            channels_to_scan = channels_to_scan[:max_channels]
+            threads_by_parent: dict[int, list] = {int(ch.id): [] for ch in channels_to_scan}
+            if guild is not None and channels_to_scan:
+                active_threads = getattr(guild, "active_threads", None)
+                if active_threads is not None:
+                    try:
+                        active = await active_threads()
+                        for thread in active:
+                            parent_id = getattr(thread, "parent_id", None)
+                            if parent_id in threads_by_parent:
+                                threads_by_parent[parent_id].append(thread)
+                    except Exception:
+                        outcome["permission_failures"] += 1
+                for channel in channels_to_scan:
+                    for private, joined in ((False, False), (True, True)):
+                        try:
+                            async for thread in channel.archived_threads(
+                                private=private, joined=joined, limit=None
+                            ):
+                                known = {item.id for item in threads_by_parent[channel.id]}
+                                if thread.id not in known:
+                                    threads_by_parent[channel.id].append(thread)
+                        except Exception:
+                            continue
+
+            source_count = len(channels_to_scan) + sum(len(v) for v in threads_by_parent.values())
+            outcome["channel_count"] = len(channels_to_scan)
+            outcome["thread_count"] = source_count - len(channels_to_scan)
             outcome["skipped_channels"] = skipped_channels
-            resolved_ids = ", ".join(str(c.id) for c in channels_to_scan) or "none"
-            console.print(f"[bold]Resolved channels to scan ({len(channels_to_scan)}):[/bold] {resolved_ids}")
-
-            if dynamic_set and channels_to_scan:
-                # Two-stage consent: the exact set was unknowable before
-                # connecting, so show it and re-confirm BEFORE any history read.
+            resolved_channel_ids = ", ".join(str(channel.id) for channel in channels_to_scan) or "none"
+            console.print(
+                f"[bold]Resolved channels to scan ({len(channels_to_scan)}):[/bold] "
+                f"{resolved_channel_ids}"
+            )
+            if skipped_channels:
+                skipped_ids = ", ".join(str(item) for item in skipped_channels)
                 console.print(
-                    f"[bold]Exact scope for consent:[/bold] {len(channels_to_scan)} channel(s) "
-                    f"[{resolved_ids}], max {bounded_limit} msgs/channel, "
-                    f"{max_total_msgs} messages total"
+                    f"[yellow]skipped {len(skipped_channels)} requested channel ID(s) "
+                    f"(not found or filtered by the watch): {skipped_ids}[/yellow]"
+                )
+            if dynamic_set and channels_to_scan:
+                console.print(
+                    f"[bold]Exact scope for consent:[/bold] {source_count} channels/threads"
                 )
                 confirmed = Prompt.ask(
-                    "Read history from exactly these channels now?",
+                    f"Read all history from these {source_count} channels/threads now?",
                     choices=["y", "n"],
                     default="n",
                 ) == "y"
@@ -645,55 +629,83 @@ def bootstrap_cmd(
                     await client.close()
                     return
 
-            collected: list[HistoryMessage] = []
-            for ch in channels_to_scan:
-                if len(collected) >= max_total_msgs:
-                    break
-                remaining = max_total_msgs - len(collected)
-                batch = []  # newest-first, as discord.py yields history
-                try:
-                    async for m in ch.history(limit=min(bounded_limit, remaining)):
-                        if getattr(m.author, "bot", False):
-                            outcome["bot_excluded"] += 1
-                            continue
-                        if getattr(m, "type", None) != discord.MessageType.default:
-                            outcome["system_excluded"] += 1
-                            continue
-                        if not (m.content or "").strip():
-                            outcome["empty_excluded"] += 1
-                            continue
-                        batch.append(m)
-                        if len(batch) >= remaining:
-                            break
-                except Exception:
-                    outcome["permission_failures"] += 1
-                    continue
-                batch.reverse()  # analysis input must be chronological within each channel
-                for m in batch:
-                    created = getattr(m, "created_at", None)
-                    collected.append(
-                        HistoryMessage(
-                            channel_id=str(ch.id),
-                            author_id=str(m.author.id),
-                            author_name=getattr(m.author, "display_name", getattr(m.author, "name", "member")),
-                            timestamp_iso=created.isoformat() if created is not None else "",
-                            content=(m.content or "")[:BOOTSTRAP_MAX_MESSAGE_CHARS],
-                        )
-                    )
+            batch: list[HistoryMessage] = []
+            batch_chars = 0
+            summaries = []
 
-            outcome["collected"] = collected
-            if collected:
-                console.print(f"Synthesizing dynamics for scope {scope} from {len(collected)} message(s)...")
+            async def flush_batch() -> None:
+                nonlocal batch, batch_chars
+                if not batch:
+                    return
+                outcome["analysis_batches"] += 1
                 try:
-                    outcome["analysis"] = await engine.analyze_history(
+                    summary = await engine.analyze_history(
                         "discord",
                         scope,
-                        collected,
-                        max_messages=max_total_msgs,
-                        max_total_chars=max_total_msgs * BOOTSTRAP_MAX_MESSAGE_CHARS,
+                        batch,
+                        max_messages=ANALYSIS_BATCH_MAX_MESSAGES,
+                        max_total_chars=ANALYSIS_BATCH_MAX_CHARS,
                     )
                 except ValueError as exc:
-                    outcome["analysis_error"] = str(exc) or "history exceeded analysis bounds"
+                    outcome["analysis_error"] = str(exc) or "history analysis rejected input"
+                    raise
+                summaries.append(summary)
+                if summary is not None:
+                    outcome["member_ids"].update(summary.member_ids)
+                batch = []
+                batch_chars = 0
+
+            async def collect_source(source) -> None:
+                nonlocal batch_chars
+                source_messages = []
+                try:
+                    async for message in source.history(limit=limit):
+                        if getattr(message.author, "bot", False):
+                            outcome["bot_excluded"] += 1
+                            continue
+                        if getattr(message, "type", None) != discord.MessageType.default:
+                            outcome["system_excluded"] += 1
+                            continue
+                        content = (message.content or "").strip()
+                        if not content:
+                            outcome["empty_excluded"] += 1
+                            continue
+                        source_messages.append(message)
+                except Exception:
+                    outcome["permission_failures"] += 1
+                    return
+
+                for message in reversed(source_messages):
+                    created = getattr(message, "created_at", None)
+                    content = (message.content or "")[:BOOTSTRAP_MAX_MESSAGE_CHARS]
+                    item = HistoryMessage(
+                        channel_id=str(source.id),
+                        author_id=str(message.author.id),
+                        author_name=getattr(
+                            message.author, "display_name",
+                            getattr(message.author, "name", "member"),
+                        ),
+                        timestamp_iso=created.isoformat() if created is not None else "",
+                        content=content,
+                    )
+                    if batch and (
+                        len(batch) >= ANALYSIS_BATCH_MAX_MESSAGES
+                        or batch_chars + len(content) > ANALYSIS_BATCH_MAX_CHARS
+                    ):
+                        await flush_batch()
+                    batch.append(item)
+                    batch_chars += len(content)
+                    outcome["collected"] += 1
+
+            try:
+                for channel in channels_to_scan:
+                    await collect_source(channel)
+                    for thread in threads_by_parent.get(int(channel.id), []):
+                        await collect_source(thread)
+                await flush_batch()
+            except ValueError:
+                pass
+            outcome["analysis"] = summaries[-1] if summaries else None
             await client.close()
 
         await client.start(token)
@@ -710,38 +722,30 @@ def bootstrap_cmd(
     if result["declined"]:
         console.print("[yellow]bootstrap aborted — no history read, nothing written, no model call.[/yellow]")
         return
-
-    if result["skipped_channels"]:
-        skipped_ids = ", ".join(str(c) for c in result["skipped_channels"])
-        console.print(
-            f"[yellow]skipped {len(result['skipped_channels'])} requested channel ID(s) "
-            f"(not found or filtered by the watch): {skipped_ids}[/yellow]"
-        )
-
     failures: list[str] = []
     if result["guild_missing"]:
         failures.append("guild not accessible to bot")
     if result["permission_failures"]:
-        failures.append(f"{result['permission_failures']} channel(s) unreadable (permission or access failure)")
+        failures.append(f"{result['permission_failures']} source(s) unreadable (permission or access failure)")
     if result["analysis_error"]:
         failures.append(f"history analysis rejected input bounds: {result['analysis_error']}")
     console.print(
         "[bold]Collection summary:[/bold] "
-        f"collected={len(result['collected'])}/{max_total_msgs}, "
-        f"bot-excluded={result['bot_excluded']}, "
-        f"system-excluded={result['system_excluded']}, "
-        f"empty-excluded={result['empty_excluded']}, "
-        f"permission-failed={result['permission_failures']}"
+        f"channels={result['channel_count']}, threads={result['thread_count']}, "
+        f"collected={result['collected']}, batches={result['analysis_batches']}, "
+        f"bot-excluded={result['bot_excluded']}, system-excluded={result['system_excluded']}, "
+        f"empty-excluded={result['empty_excluded']}, permission-failed={result['permission_failures']}"
     )
     if failures:
         for failure in failures:
             console.print(f"[red]bootstrap failure: {failure}[/red]")
         raise typer.Exit(1)
-
     if result["collected"]:
-        analysis = result["analysis"]
-        count = len(analysis.member_ids) if analysis is not None else 0
-        console.print(f"[bold green]Bootstrap complete! Initialized {count} member profile(s).[/bold green]")
+        console.print(
+            f"[bold green]Bootstrap complete! Initialized "
+            f"{len(result['member_ids'])} member profile(s) across "
+            f"{result['analysis_batches']} analysis batch(es).[/bold green]"
+        )
     else:
         console.print("[yellow]No accessible public messages found to analyze.[/yellow]")
 

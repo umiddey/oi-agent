@@ -403,26 +403,42 @@ class _FakeMessage:
 class _FakeChannel:
     """Serves messages newest-first like discord.py history."""
 
-    def __init__(self, cid, messages):
+    def __init__(self, cid, messages, *, archived_threads=None, parent_id=None):
         self.id = cid
+        self.parent_id = parent_id
         self._messages = messages
+        self._archived_threads = archived_threads or []
         self.history_calls = 0
+        self.archived_thread_calls = 0
 
     def history(self, limit=None):
         self.history_calls += 1
 
         async def _gen():
-            for m in self._messages:
+            messages = self._messages if limit is None else self._messages[:limit]
+            for m in messages:
                 yield m
+
+        return _gen()
+
+    def archived_threads(self, *, private=False, joined=False, limit=None):
+        self.archived_thread_calls += 1
+
+        async def _gen():
+            for thread in self._archived_threads:
+                yield thread
 
         return _gen()
 
 
 class _FakeGuild:
-    def __init__(self, gid, text_channels):
+    def __init__(self, gid, text_channels, active_threads=None):
         self.id = gid
         self.text_channels = text_channels
+        self._active_threads = active_threads or []
 
+    async def active_threads(self):
+        return self._active_threads
 
 def _make_fake_client(guilds, channels_by_id=None):
     """Return a discord.Client replacement wired to fake guild/channel objects."""
@@ -633,7 +649,7 @@ def test_bootstrap_yes_collects_chronological_history_with_exclusions(tmp_path, 
     assert "empty-excluded=1" in result.output
     assert "permission-failed=0" in result.output
     assert "Initialized 3 member profile(s)" in result.output
-    assert record["max_messages"] == 125  # default limit 25 x 5 channels
+    assert record["max_messages"] == 120  # bounded analysis batch, not collection cap
     assert record["stores"] and record["stores"][0].closed
 
 
@@ -701,8 +717,8 @@ def test_bootstrap_real_engine_wiring(tmp_path, monkeypatch):
         store.close()
 
 
-def test_bootstrap_enforces_total_bound(tmp_path, monkeypatch):
-    """Collection stops at the advertised total bound; extra channels are never read."""
+def test_bootstrap_reads_all_explicit_channels_without_collection_cap(tmp_path, monkeypatch):
+    """Collection reads every explicitly selected channel; only analysis batches are bounded."""
     cfg_path, _ = _guild_watch_config(tmp_path, allowed=None)
     channels = [
         _FakeChannel(300 + i, [
@@ -730,10 +746,10 @@ def test_bootstrap_enforces_total_bound(tmp_path, monkeypatch):
         "--channels", "300,301,302,303,304,305", "--config", str(cfg_path),
     ])
     assert result.exit_code == 0, result.output
-    assert len(record["messages"]) == 10  # bound: limit 2 x 5 channels
-    assert record["max_messages"] == 10
-    assert "collected=10/10" in result.output
-    assert channels[5].history_calls == 0  # beyond the 5-channel cap, never read
+    assert len(record["messages"]) == 12  # 2 messages from all 6 channels
+    assert record["max_messages"] == 120
+    assert "channels=6, threads=0, collected=12" in result.output
+    assert channels[5].history_calls == 1
 
 
 def test_bootstrap_surfaces_engine_bound_error_as_failure(tmp_path, monkeypatch):
@@ -862,6 +878,49 @@ def test_bootstrap_channels_option_runs_exact_ids_non_interactively(tmp_path, mo
     assert [m.channel_id for m in record["messages"]] == ["333", "444"]
     assert record["stores"] and record["stores"][0].closed
 
+def test_bootstrap_reads_active_and_archived_threads(tmp_path, monkeypatch):
+    """Guild bootstrap includes active and archived thread history under selected channels."""
+    cfg_path, _ = _guild_watch_config(tmp_path, allowed="333")
+    archived = _FakeChannel(
+        335,
+        [_FakeMessage(35, "archived thread message", author_id="u3")],
+        parent_id=333,
+    )
+    active = _FakeChannel(
+        334,
+        [_FakeMessage(34, "active thread message", author_id="u2")],
+        parent_id=333,
+    )
+    parent = _FakeChannel(
+        333,
+        [_FakeMessage(33, "parent message", author_id="u1")],
+        archived_threads=[archived],
+    )
+    payload = ReflectionSummary(True, False, False, 1, member_ids=("u1", "u2", "u3"))
+    record = {"store_constructed": 0, "stores": [], "engine_constructed": 0,
+              "analyze_calls": 0, "messages": [], "max_messages": None}
+    monkeypatch.setattr(
+        discord, "Client", _make_fake_client([_FakeGuild(222, [parent], [active])])
+    )
+    monkeypatch.setattr(cli, "Store", _make_recording_store(record))
+    monkeypatch.setattr(
+        "oi_agent.reflection.engine.ReflectionEngine",
+        _make_fake_engine(record, result=payload),
+    )
+    monkeypatch.setenv("OI_DISCORD_TOKEN", "test-token")
+
+    result = runner.invoke(app, [
+        "bootstrap", "--scope", "222", "--yes", "--config", str(cfg_path)
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "channels=1, threads=2, collected=3" in result.output
+    assert parent.history_calls == 1
+    assert active.history_calls == 1
+    assert archived.history_calls == 1
+    assert {message.channel_id for message in record["messages"]} == {"333", "334", "335"}
+
+
 
 def test_bootstrap_channels_with_yes_never_prompts(tmp_path, monkeypatch):
     """--channels + --yes is fully pre-consented: exactly 0 prompts, history read directly."""
@@ -946,8 +1005,8 @@ def test_bootstrap_dynamic_interactive_two_stage_consent(tmp_path, monkeypatch):
     assert "Exact scope for consent" in result.output
     # Two stages: pre-connect consent, then post-resolve exact-channel confirmation.
     assert [label for label, _ in prompts] == [
-        "Proceed with reading channel history and synthesizing team memory?",
-        "Read history from exactly these channels now?",
+        "Proceed with reading channel/thread history and synthesizing team memory?",
+        "Read all history from these 2 channels/threads now?",
     ]
     assert prompts[1][1].get("default") == "n"  # second stage defaults to No
     # The exact-channel confirmation happened before any history fetch.
@@ -1050,15 +1109,13 @@ def test_bootstrap_dry_run_unrestricted_guild_states_dynamic_set(tmp_path, monke
     ])
     assert result.exit_code == 0, result.output
     assert "dynamic" in result.output
-    assert "dry-run enabled" in result.output
-    # No fake channel IDs may be listed for a dynamic set.
     assert "Channels (" not in result.output
     assert record == {"client_constructed": 0, "store_constructed": 0,
                       "engine_constructed": 0, "secrets_loaded": 0}
 
 
-def test_bootstrap_channels_option_validation_and_cap(tmp_path, monkeypatch):
-    """--channels validates numeric input, dedupes, caps at 5, and is help-documented."""
+def test_bootstrap_channels_option_validation_without_cap(tmp_path, monkeypatch):
+    """--channels validates numeric input and deduplicates without a five-channel cap."""
     cfg_path, _ = _guild_watch_config(tmp_path, allowed=None)
 
     class _NoStore:
@@ -1070,8 +1127,7 @@ def test_bootstrap_channels_option_validation_and_cap(tmp_path, monkeypatch):
     # --help documents the option and the exact-consent behavior.
     help_res = runner.invoke(app, ["bootstrap", "--help"], env={"COLUMNS": "200"})
     assert help_res.exit_code == 0, help_res.output
-    assert "--channels" in help_res.output
-    assert "capped" in help_res.output
+    assert "all available history" in help_res.output
 
     # Non-numeric ID: clean validation error, no Store construction.
     bad = runner.invoke(app, [
@@ -1096,9 +1152,9 @@ def test_bootstrap_channels_option_validation_and_cap(tmp_path, monkeypatch):
         "--config", str(known_cfg),
     ])
     assert wrong.exit_code == 1
-    assert "already known" in wrong.output
+    assert "unrestricted guild watches" in wrong.output
 
-    # More than 5 IDs: capped to the first 5; the rest are never read.
+    # More than 5 IDs are all accepted and read.
     channels = [
         _FakeChannel(cid, [_FakeMessage(cid, f"message {cid} text", author_id=f"u{cid}")])
         for cid in (333, 444, 555, 666, 777, 888)
@@ -1122,10 +1178,9 @@ def test_bootstrap_channels_option_validation_and_cap(tmp_path, monkeypatch):
         "--channels", "333,444,555,666,777,888", "--config", str(cfg_path),
     ])
     assert cap_res.exit_code == 0, cap_res.output
-    assert "capped to the first 5" in cap_res.output
-    assert "Resolved channels to scan (5)" in cap_res.output
-    assert by_id[888].history_calls == 0
-    assert all(by_id[cid].history_calls == 1 for cid in (333, 444, 555, 666, 777))
+    assert "Resolved channels to scan (6)" in cap_res.output
+    assert "channels=6, threads=0, collected=6" in cap_res.output
+    assert all(by_id[cid].history_calls == 1 for cid in (333, 444, 555, 666, 777, 888))
 
 
 # ---------------------------------------------------------------------------

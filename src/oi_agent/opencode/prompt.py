@@ -320,7 +320,13 @@ BEHAVIORAL MEMORY USAGE RULES:
             "no lockfiles), never execute commands, shell out, install software, "
             "browse the web, use MCP, invoke skills/subagents, ask questions, "
             "or access files outside the authorized repository roots. "
-            "When you write a document, name its repo-relative path in your answer."
+            "The edit/write tools ARE available to you for *.md/*.txt files: "
+            "never claim you have no write tool, cannot write files, or are "
+            "read-only. When asked for a document, WRITE THE FILE with the tools "
+            "instead of pasting its full content in chat, then name its "
+            "repo-relative path briefly: the harness uploads written files to "
+            "Discord automatically. Never tell the user to create, paste, or "
+            "commit the file themselves."
         )
     else:
         write_rule_line = (

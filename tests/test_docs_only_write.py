@@ -118,6 +118,15 @@ def test_prompt_docs_only_allows_docs_with_scope():
     assert "no code, no configs" in prompt
 
 
+def test_prompt_docs_only_forbids_false_inability_claims():
+    """Docs-only prompt bans 'no write tool / read-only' confabulation."""
+    prompt = build_prompt("voice", write_mode="docs-only")
+    assert "never claim you have no write tool" in prompt
+    assert "WRITE THE FILE with the tools" in prompt
+    assert "Never tell the user to create, paste, or commit the file" in prompt
+    assert "never claim you have no write tool" not in build_prompt("voice")
+
+
 # --- config + CLI ---------------------------------------------------------
 
 

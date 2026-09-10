@@ -64,8 +64,9 @@ class FakeResponse:
 class FakeMention:
     """Minimal Discord mention object."""
 
-    def __init__(self, user_id: int) -> None:
+    def __init__(self, user_id: int, display_name: str = "ultron") -> None:
         self.id = user_id
+        self.display_name = display_name
 
 class FakeChannel:
     """Fake Discord channel or thread with message history."""
@@ -277,7 +278,7 @@ async def test_downtime_message_recovery_on_on_ready(tmp_path: Path, monkeypatch
 
     deliveries = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         return Reply("recovered reply", "sha123", session_id="sess-recovered")
 
     async def fake_deliver(self, channel_id, target_channel_id, chunk, nonce, reply_to_message_id=None, client=None):
@@ -321,7 +322,7 @@ async def test_active_and_archived_thread_recovery(tmp_path: Path, monkeypatch) 
     watcher._test_guilds = [guild]
     runs = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         runs.append((question, session_id))
         return Reply(f"ans for {question}", "sha", session_id="thread-sess")
 
@@ -353,7 +354,7 @@ async def test_burst_coalescing_preserves_all_source_message_ids(tmp_path: Path,
 
     questions_seen = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         questions_seen.append(question)
         return Reply("combined answer", "sha123", session_id="burst-session")
 
@@ -372,7 +373,7 @@ async def test_burst_coalescing_preserves_all_source_message_ids(tmp_path: Path,
     await asyncio.sleep(0.12)
     await watcher.close()
 
-    assert questions_seen == ["<@99> part 2 final"]
+    assert questions_seen == ["@ultron (user id 99) part 2 final"]
 
     # Verify BOTH message 501 and 502 are marked done with the same batch_id
     jobs = watcher._store._conn.execute(
@@ -463,7 +464,7 @@ async def test_lease_expiry_recovery_after_simulated_crash(tmp_path: Path, monke
 
     runs = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         runs.append(question)
         return Reply("recovered from crash", "sha999", session_id="crash-sess")
 
@@ -477,7 +478,7 @@ async def test_lease_expiry_recovery_after_simulated_crash(tmp_path: Path, monke
     await asyncio.sleep(0.05)
     await watcher.close()
 
-    assert runs == ["<@99> recover me"]
+    assert runs == ["@ultron (user id 99) recover me"]
     job_status = watcher._store._conn.execute(
         "SELECT status FROM mention_jobs WHERE source_message_id = 801"
     ).fetchone()[0]
@@ -635,7 +636,7 @@ async def test_concurrent_conversations_burst_parallelism(
     started = []
     release = asyncio.Event()
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         started.append(question)
         if len(started) == 2:
             release.set()
@@ -661,7 +662,10 @@ async def test_concurrent_conversations_burst_parallelism(
     # Both conversations should start concurrently and reach fake_run
     await asyncio.wait_for(release.wait(), timeout=2.0)
     assert len(started) == 2
-    assert set(started) == {"<@99> conv 1", "<@99> conv 2"}
+    assert set(started) == {
+        "@ultron (user id 99) conv 1",
+        "@ultron (user id 99) conv 2",
+    }
 
     await asyncio.sleep(0.05)
     await watcher.close()

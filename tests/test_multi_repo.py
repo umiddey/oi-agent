@@ -45,8 +45,9 @@ class FakeAuthor:
 class FakeMention:
     """Minimal Discord mention object."""
 
-    def __init__(self, user_id: int) -> None:
+    def __init__(self, user_id: int, display_name: str = "ultron") -> None:
         self.id = user_id
+        self.display_name = display_name
 
 
 class FakeMessage:

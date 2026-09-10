@@ -27,8 +27,11 @@ uv pip install -e . --force-reinstall --no-deps
 - Git remote creds are read-scoped only. Never add code that writes/pushes.
 - OpenCode runs with `OPENCODE_DISABLE_PROJECT_CONFIG=1`, isolated HOME/XDG
   roots, an inline native `agent.oi`, and no `--auto`.
-- Native permissions allow only repository-scoped `read`, `glob`, `grep`, `list`,
-  and `lsp`; edit/bash/web/MCP/skill/task/question/external access is denied.
+- Native permissions are read-only by default (repository-scoped `read`, `glob`,
+  `list`, and `lsp`; edit/bash/web/MCP/skill/task/question/external access is
+  denied). `write_mode=docs-only` optionally grants `edit`/`write` for
+  `*.md`/`*.txt` only (secrets and code stay denied), further narrowable via
+  `write_dirs`. Reviews always run read-only.
 - Only the final completed OpenCode assistant message is deliverable;
   intermediate narration and reasoning never reach the outbox or Discord.
 - MR/PR references resolve only against configured watched repositories.

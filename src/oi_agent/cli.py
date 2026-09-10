@@ -814,7 +814,8 @@ def config_show(
     for name in (
         "discord_token_env", "db_path", "personality", "max_reply_chars",
         "reply_delivery", "opencode_binary", "opencode_model", "opencode_steps",
-        "opencode_timeout_seconds", "environment_mode",
+        "opencode_timeout_seconds", "environment_mode", "write_mode",
+        "write_dirs",
     ):
         console.print(f"{name} = {getattr(cfg, name)}")
     for target in cfg.watches:
@@ -849,7 +850,8 @@ def config_set(
     allowed = {
         "personality", "max_reply_chars", "reply_delivery", "discord_token_env",
         "db_path", "opencode_binary", "opencode_model", "opencode_steps",
-        "opencode_timeout_seconds", "environment_mode",
+        "opencode_timeout_seconds", "environment_mode", "write_mode",
+        "write_dirs",
     }
     if key not in allowed:
         console.print(f"[red]unknown key '{key}'[/red]")
@@ -866,7 +868,10 @@ def config_set(
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         console.print(f"[red]config error: {exc}[/red]")
         raise typer.Exit(1)
-    setattr(cfg, key, _coerce(value))
+    if key == "write_dirs":
+        setattr(cfg, key, [p.strip().strip("/") for p in value.split(",") if p.strip().strip("/")])
+    else:
+        setattr(cfg, key, _coerce(value))
     try:
         save_config(cfg, config)
     except ValueError as exc:

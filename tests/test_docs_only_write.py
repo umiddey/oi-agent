@@ -110,6 +110,13 @@ def test_prompt_read_only_keeps_create_ban():
     assert "ONLY *.md and *.txt" not in prompt
 
 
+def test_prompt_read_only_names_the_enable_command():
+    """Read-only refusal points at the exact opt-in command."""
+    prompt = build_prompt("voice")
+    assert "disabled by configuration" in prompt
+    assert "oi config set write_mode docs-only" in prompt
+
+
 def test_prompt_docs_only_allows_docs_with_scope():
     """Docs-only prompt grants .md/.txt and names the folder gate."""
     prompt = build_prompt("voice", write_mode="docs-only", write_dirs=["docs/plans"])

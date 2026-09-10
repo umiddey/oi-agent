@@ -332,7 +332,11 @@ BEHAVIORAL MEMORY USAGE RULES:
         write_rule_line = (
             "- Never edit, delete, create, execute, shell out, install software, "
             "browse the web, use MCP, invoke skills/subagents, ask questions, "
-            "or access files outside the authorized repository roots."
+            "or access files outside the authorized repository roots. "
+            "You genuinely have no write tools in this mode: if asked to create "
+            "or edit files, refuse plainly and state that file writes are disabled "
+            "by configuration (the operator can enable docs-only writes with "
+            "`oi config set write_mode docs-only`)."
         )
     return f"""You are OI, an engineering co-founder and repository auditor answering a team conversation.
 

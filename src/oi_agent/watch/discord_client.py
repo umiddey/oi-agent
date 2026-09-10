@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -39,6 +40,52 @@ MAX_ATTEMPTS = 5
 MAX_TRACKED_REFLECTION_DELIVERIES = 500
 
 
+# Raw Discord user-mention markup (<@id> and <@!id> nickname form).
+_USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def _resolve_user_mentions(content: str, mentions: list[Any] | None) -> str:
+    """Replace raw Discord user-mention markup with grounded names.
+
+    Discord delivers ``<@id>`` markup rather than names, which forces the model
+    to guess who a mention refers to. Each resolvable mention becomes
+    ``@DisplayName (user id N)``; unknown ids degrade to an explicit unknown
+    marker so the model never has to infer.
+
+    Args:
+        content (str): Raw message content.
+        mentions (list[Any] | None): ``message.mentions`` objects for lookup.
+
+    Returns:
+        str: Content with user mentions resolved to names and ids.
+    """
+    if not content or "<@" not in content:
+        return content
+    names: dict[str, str] = {}
+    for user in mentions or ():
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            continue
+        name = (
+            getattr(user, "display_name", None)
+            or getattr(user, "global_name", None)
+            or getattr(user, "name", None)
+            or "unknown"
+        )
+        names[str(user_id)] = str(name)
+
+    def _sub(match: re.Match[str]) -> str:
+        user_id = match.group(1)
+        name = names.get(user_id)
+        return (
+            f"@{name} (user id {user_id})"
+            if name
+            else f"@unknown (user id {user_id})"
+        )
+
+    return _USER_MENTION_RE.sub(_sub, content)
+
+
 def _message_evidence_line(message: discord.Message) -> str:
     """Render message text and attachment metadata for model context.
 
@@ -51,7 +98,10 @@ def _message_evidence_line(message: discord.Message) -> str:
     Returns:
         str: Context line for the conversation history.
     """
-    body = (message.content or "").strip()
+    body = _resolve_user_mentions(
+        (message.content or "").strip(),
+        list(getattr(message, "mentions", None) or ()),
+    )
     evidence: list[str] = []
     for att in getattr(message, "attachments", []):
         fn = getattr(att, "filename", "unnamed")
@@ -736,8 +786,24 @@ class OIWatcher(discord.Client):
 
             author_name = getattr(trigger_message.author, "display_name", "unknown")
             author_id = getattr(trigger_message.author, "id", 0)
-            question = trigger_message.content or ""
+            question = _resolve_user_mentions(
+                trigger_message.content or "",
+                list(getattr(trigger_message, "mentions", None) or ()),
+            )
             excerpt = await _thread_excerpt(ch)
+            # Ground-truth self identity for the prompt: the display name the
+            # bot actually posts under in this conversation (guild nickname
+            # aware) plus its stable user id.
+            bot_id = self.user.id if self.user else 0
+            guild = getattr(ch, "guild", None)
+            # guild.me is the bot's own Member in this guild (nickname aware).
+            identity_source = getattr(guild, "me", None) or self.user
+            bot_name = ""
+            if identity_source is not None:
+                bot_name = str(
+                    getattr(identity_source, "display_name", "")
+                    or getattr(identity_source, "name", "")
+                )
             sem = self._channel_semaphore(owner_channel_id)
 
             async with sem:
@@ -766,6 +832,8 @@ class OIWatcher(discord.Client):
                         excerpt,
                         session_id=session_id,
                         member_id=participant_id,
+                        bot_name=bot_name,
+                        bot_id=bot_id,
                     )
                     if not reply.ok and reply.error_class in {
                         "unknown_session",
@@ -780,6 +848,8 @@ class OIWatcher(discord.Client):
                             excerpt,
                             session_id=None,
                             member_id=participant_id,
+                            bot_name=bot_name,
+                            bot_id=bot_id,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -846,6 +916,24 @@ class OIWatcher(discord.Client):
                         break
 
                 if not delivery_failed:
+                    # Best-effort doc uploads (docs-only mode): the text batch
+                    # above is the durable record; file failures only log.
+                    for doc_path in (reply.attachments or ()):
+                        try:
+                            file_res = await poster.deliver_file(
+                                channel_id=conversation_id,
+                                target_channel_id=owner_channel_id,
+                                path=doc_path,
+                                reply_to_message_id=latest_msg_id,
+                            )
+                            if not file_res.ok:
+                                logger.warning(
+                                    "[watcher] doc upload failed class=%s path=%s",
+                                    file_res.error_class,
+                                    doc_path.rsplit("/", 1)[-1],
+                                )
+                        except Exception:
+                            logger.exception("[watcher] doc upload crashed")
                     self._store.complete_delivery_batch(
                         batch_id,
                         repo_path=repo_path,

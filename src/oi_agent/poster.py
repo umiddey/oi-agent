@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(30.0)
 
+DOC_ATTACHMENT_SUFFIXES = (".md", ".txt")
+DOC_ATTACHMENT_CONTENT_TYPES = {".md": "text/markdown", ".txt": "text/plain"}
+MAX_DOC_ATTACHMENT_UPLOAD_BYTES = 8 * 1024 * 1024
+
 
 @dataclass
 class DeliveryResult:
@@ -359,6 +363,130 @@ class Poster:
             error_class="rate_limited",
             status_code=429,
         )
+
+    async def deliver_file(
+        self,
+        channel_id: int,
+        target_channel_id: int,
+        path: str,
+        reply_to_message_id: int | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> DeliveryResult:
+        """Upload one .md/.txt doc written by the agent as a Discord attachment.
+
+        Best-effort companion to the durable text batch: the text reply stays
+        the delivery record, so file uploads do not reserve hourly cap units.
+        The channel allowlist and pause switch still apply.
+
+        Args:
+            channel_id (int): Destination channel/thread snowflake id.
+            target_channel_id (int): Owning watch-target channel snowflake id.
+            path (str): Absolute path of the .md/.txt file to upload.
+            reply_to_message_id (int | None): Optional source message to reply to.
+            client (httpx.AsyncClient | None): Optional shared async HTTP client.
+
+        Returns:
+            DeliveryResult: Outcome with message ID or error classification.
+        """
+        import json
+        import os
+
+        target = self._cfg.target_for_channel(target_channel_id)
+        if target is None:
+            logger.error("[poster] target not watchlisted: %s", target_channel_id)
+            return DeliveryResult(ok=False, error_class="target_not_found")
+        if self._store.is_paused():
+            logger.warning("[poster] posting paused")
+            return DeliveryResult(ok=False, error_class="paused")
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix not in DOC_ATTACHMENT_SUFFIXES:
+            return DeliveryResult(ok=False, error_class="file_type_denied")
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return DeliveryResult(ok=False, error_class="file_not_found")
+        if size > MAX_DOC_ATTACHMENT_UPLOAD_BYTES:
+            return DeliveryResult(ok=False, error_class="file_too_large")
+        try:
+            with open(path, "rb") as handle:
+                content = handle.read()
+        except OSError:
+            return DeliveryResult(ok=False, error_class="file_not_found")
+
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        payload = {
+            "content": "",
+            "nonce": f"file-{uuid.uuid4().hex[:16]}",
+            "enforce_nonce": True,
+            "allowed_mentions": {"parse": []},
+        }
+        if reply_to_message_id is not None:
+            payload["message_reference"] = {"message_id": reply_to_message_id}
+        files = {
+            "files[0]": (
+                os.path.basename(path) or "document.md",
+                content,
+                DOC_ATTACHMENT_CONTENT_TYPES[suffix],
+            )
+        }
+        data = {"payload_json": json.dumps(payload)}
+
+        async def _post(active: httpx.AsyncClient) -> DeliveryResult:
+            for attempt in range(3):
+                try:
+                    resp = await active.post(
+                        url, headers=self._headers, data=data, files=files
+                    )
+                except Exception as exc:  # noqa: BLE001 - Discord network boundary
+                    logger.error("[poster] discord file upload failed: %s", exc)
+                    return DeliveryResult(ok=False, error_class="network_error")
+                if resp.status_code in (200, 201):
+                    msg_id = None
+                    try:
+                        if callable(getattr(resp, "json", None)):
+                            resp_data = resp.json()
+                            if isinstance(resp_data, dict) and "id" in resp_data:
+                                msg_id = int(resp_data["id"])
+                    except Exception:
+                        pass
+                    return DeliveryResult(
+                        ok=True, discord_message_id=msg_id, status_code=resp.status_code
+                    )
+                if resp.status_code == 429:
+                    retry_after = 1.0
+                    try:
+                        headers = getattr(resp, "headers", {})
+                        if callable(getattr(resp, "json", None)):
+                            resp_data = resp.json()
+                            if isinstance(resp_data, dict) and "retry_after" in resp_data:
+                                retry_after = float(resp_data["retry_after"])
+                        elif hasattr(headers, "get") and headers.get("retry-after") is not None:
+                            retry_after = float(headers.get("retry-after"))
+                    except Exception:
+                        retry_after = 1.0
+                    retry_after = min(max(retry_after, 0.01), 10.0)
+                    if attempt < 2:
+                        await asyncio.sleep(retry_after)
+                        continue
+                    return DeliveryResult(
+                        ok=False, error_class="rate_limited",
+                        status_code=429, retry_after=retry_after,
+                    )
+                if resp.status_code == 403:
+                    return DeliveryResult(ok=False, error_class="permission_denied", status_code=403)
+                if resp.status_code == 404:
+                    return DeliveryResult(ok=False, error_class="channel_not_found", status_code=404)
+                logger.error(
+                    "[poster] discord refused file upload: %s %s",
+                    resp.status_code, getattr(resp, "text", "")[:200],
+                )
+                return DeliveryResult(ok=False, error_class=f"http_{resp.status_code}", status_code=resp.status_code)
+            return DeliveryResult(ok=False, error_class="rate_limited", status_code=429)
+
+        if client is not None:
+            return await _post(client)
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as owned_client:
+            return await _post(owned_client)
 
     async def send(
         self,

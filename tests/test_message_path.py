@@ -27,9 +27,10 @@ class FakeAuthor:
 class FakeMention:
     """Minimal Discord mention object."""
 
-    def __init__(self, user_id):
-        """Store the mentioned user ID."""
+    def __init__(self, user_id, display_name="ultron"):
+        """Store the mentioned user ID and its display name."""
         self.id = user_id
+        self.display_name = display_name
 
 class FakeResponse:
     """Mock response for discord exception initialization."""
@@ -103,7 +104,7 @@ async def test_direct_mention_reaches_runner_and_poster_once(tmp_path, monkeypat
     channel._history = [message]
     calls = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         """Return a deterministic successful OpenCode reply."""
         calls.append((author, question, session_id))
         return Reply("answer", "abc123", session_id="new-session")
@@ -118,7 +119,7 @@ async def test_direct_mention_reaches_runner_and_poster_once(tmp_path, monkeypat
     await watcher.on_message(message)
     await asyncio.sleep(0.05)
 
-    assert calls[0] == ("user1", "<@99> inspect", None)
+    assert calls[0] == ("user1", "@ultron (user id 99) inspect", None)
     assert calls[-1] == (111, 111, "answer")
     assert watcher._store.get_opencode_session(111, tmp_path / "repo") == "new-session"
 
@@ -131,7 +132,7 @@ async def test_poster_failure_does_not_persist_session(tmp_path, monkeypatch):
     message = FakeMessage(1, channel, FakeAuthor(7), "<@99> inspect", [FakeMention(99)])
     channel._history = [message]
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         return Reply("answer", "abc123", session_id="unsent-session")
 
     async def fake_deliver_fail(
@@ -172,7 +173,7 @@ async def test_burst_coalescing_keeps_latest_question(tmp_path, monkeypatch):
     await watcher.on_message(second)
     await asyncio.sleep(0.05)
 
-    assert questions == ["<@99> latest"]
+    assert questions == ["@ultron (user id 99) latest"]
 
 
 @pytest.mark.asyncio
@@ -187,10 +188,10 @@ async def test_trigger_during_run_gets_one_followup(tmp_path, monkeypatch):
     release = asyncio.Event()
     questions = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         """Hold the first run open while the second trigger arrives."""
         questions.append(question)
-        if question == first.content:
+        if question == "@ultron (user id 99) first":
             started.set()
             await release.wait()
         return Reply("answer", "sha", session_id=f"session-{len(questions)}")
@@ -206,10 +207,13 @@ async def test_trigger_during_run_gets_one_followup(tmp_path, monkeypatch):
     assert started.is_set()
     await watcher.on_message(second)
     await asyncio.sleep(0)
-    assert questions == [first.content]
+    assert questions == ["@ultron (user id 99) first"]
     release.set()
     await asyncio.sleep(0.05)
-    assert questions == [first.content, second.content]
+    assert questions == [
+        "@ultron (user id 99) first",
+        "@ultron (user id 99) follow-up",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -229,7 +233,7 @@ async def test_stale_session_is_cleared_and_retried_once(
     channel._history = [message]
     session_args = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         """Fail once as stale, then succeed fresh."""
         session_args.append(session_id)
         if len(session_args) == 1:
@@ -259,7 +263,7 @@ async def test_protocol_failure_without_session_is_retried_once(tmp_path, monkey
     channel._history = [message]
     session_args = []
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         """Fail once without a stored session, then succeed."""
         session_args.append(session_id)
         if len(session_args) == 1:
@@ -287,7 +291,7 @@ async def test_thread_sessions_are_separated_from_parent_channel(tmp_path, monke
     message = FakeMessage(1, thread, FakeAuthor(7), "<@99> thread question", [FakeMention(99)])
     thread._history = [message]
 
-    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None):
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
         return Reply("thread answer", "abc123", session_id="thread-session")
 
     async def fake_deliver(self, channel_id, target_channel_id, chunk, nonce, reply_to_message_id=None, client=None):
@@ -300,3 +304,73 @@ async def test_thread_sessions_are_separated_from_parent_channel(tmp_path, monke
 
     assert watcher._store.get_opencode_session(222, tmp_path / "repo") == "thread-session"
     assert watcher._store.get_opencode_session(111, tmp_path / "repo") is None
+
+
+def test_resolve_user_mentions_resolves_known_and_unknown_ids():
+    """Known mentions render as name + id; unknown ids degrade to an explicit marker."""
+    from oi_agent.watch.discord_client import _resolve_user_mentions
+
+    resolved = _resolve_user_mentions(
+        "hey <@99> and <@!42> ping <@123456789>",
+        [FakeMention(99, "ultron"), FakeAuthor(42, "sowa")],
+    )
+    assert resolved == (
+        "hey @ultron (user id 99) and @sowa (user id 42) ping @unknown (user id 123456789)"
+    )
+    # No mention markup: content passes through untouched.
+    assert _resolve_user_mentions("plain text", []) == "plain text"
+    assert _resolve_user_mentions("", [FakeMention(99)]) == ""
+
+
+@pytest.mark.asyncio
+async def test_question_and_excerpt_reach_runner_with_resolved_mentions(tmp_path, monkeypatch):
+    """Mention markup is resolved in both the question and every excerpt line."""
+    watcher = _watcher(tmp_path)
+    channel = FakeChannel(111)
+    older = FakeMessage(1, channel, FakeAuthor(7), "hello <@99>", [FakeMention(99, "ultron")])
+    latest = FakeMessage(2, channel, FakeAuthor(7), "<@99> status?", [FakeMention(99, "ultron")])
+    channel._history = [older, latest]
+    captured = {}
+
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
+        captured["question"] = question
+        captured["excerpt"] = excerpt
+        return Reply("answer", "sha", session_id="session")
+
+    async def fake_deliver(self, *args, **kwargs):
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await watcher.on_message(latest)
+    await asyncio.sleep(0.05)
+
+    assert captured["question"] == "@ultron (user id 99) status?"
+    assert "@ultron (user id 99)" in captured["excerpt"]
+    assert "<@99>" not in captured["excerpt"]
+
+
+@pytest.mark.asyncio
+async def test_runner_receives_bot_identity(tmp_path, monkeypatch):
+    """The watcher passes its Discord display name and id to the runner."""
+    watcher = _watcher(tmp_path)
+    watcher._connection.user = FakeAuthor(99, "UltronBot")
+    channel = FakeChannel(111)
+    message = FakeMessage(1, channel, FakeAuthor(7), "<@99> inspect", [FakeMention(99)])
+    channel._history = [message]
+    captured = {}
+
+    async def fake_run(target, author, question, excerpt, session_id=None, member_id=None, bot_name="", bot_id=None):
+        captured["bot_name"] = bot_name
+        captured["bot_id"] = bot_id
+        return Reply("answer", "sha", session_id="session")
+
+    async def fake_deliver(self, *args, **kwargs):
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await watcher.on_message(message)
+    await asyncio.sleep(0.05)
+
+    assert captured == {"bot_name": "UltronBot", "bot_id": 99}

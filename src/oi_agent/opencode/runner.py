@@ -21,7 +21,7 @@ from ..agent.reply import Reply
 from ..config import Config, WatchTarget
 from .bootstrap import resolve_binary
 from .paths import resolve_opencode_paths
-from .policy import build_agent_config
+from .policy import build_agent_config, normalize_write_dirs
 from .prompt import FINAL_OUTPUT_MARKER, build_prompt
 from .provenance import audit_sha, git_pull, mutation_warning, worktree_fingerprint
 from .review_snapshots import ReviewSnapshot, ReviewSnapshotError, materialized_review
@@ -478,6 +478,93 @@ def _bounded_text(text: str, cap: int) -> str:
     return f"{text[:cut].rstrip()}{TRUNCATION_MARKER}".strip()
 
 
+MAX_DOC_ATTACHMENTS = 3
+MAX_DOC_ATTACHMENT_BYTES = 512 * 1024
+_DOC_ATTACHMENT_SUFFIXES = (".md", ".txt")
+_DOC_ATTACHMENT_SECRET_HINTS = (
+    ".env", ".pem", ".key", ".p12", ".pfx", ".crt", ".cer",
+    "credentials", "secret", "token", "id_rsa", "id_ed25519",
+)
+
+
+def _collect_doc_attachments(
+    roots: list[Path],
+    *,
+    write_dirs: list[str] | tuple[str, ...] | None,
+    since_epoch: float,
+) -> tuple[str, ...]:
+    """Collect freshly written .md/.txt docs for Discord upload.
+
+    Uses ``git status --porcelain`` plus an mtime check so pre-existing dirty
+    files are not uploaded: only docs touched since ``since_epoch`` (the agent
+    execution start, with a small tolerance) qualify. Results are bounded to
+    ``MAX_DOC_ATTACHMENTS`` files of ``MAX_DOC_ATTACHMENT_BYTES`` each.
+
+    Args:
+        roots: Repository worktrees to inspect.
+        write_dirs: Normalized repo-relative scopes; empty means anywhere.
+        since_epoch: Unix timestamp captured before agent execution.
+
+    Returns:
+        Tuple of absolute file paths, sorted, possibly empty. Never raises.
+    """
+    try:
+        scopes = normalize_write_dirs(write_dirs)
+    except Exception:  # noqa: BLE001 - fail closed to no attachments
+        return ()
+    found: list[str] = []
+    for root in roots:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain",
+                 "--untracked-files=all", "--", "."],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        for line in (result.stdout or "").splitlines():
+            if len(line) < 4:
+                continue
+            rel = line[3:].strip()
+            if " -> " in rel:  # rename/copy: take the new path
+                rel = rel.rsplit(" -> ", 1)[1].strip()
+            rel = rel.strip().strip('"')
+            if not rel or ".." in rel.split("/"):
+                continue
+            if not rel.lower().endswith(_DOC_ATTACHMENT_SUFFIXES):
+                continue
+            lowered = rel.lower()
+            if any(hint in lowered for hint in _DOC_ATTACHMENT_SECRET_HINTS):
+                continue
+            if scopes and not any(
+                rel == scope or rel.startswith(scope + "/") for scope in scopes
+            ):
+                continue
+            candidate = (root / rel).resolve()
+            try:
+                root_real = root.resolve()
+                if candidate != root_real and root_real not in candidate.parents:
+                    continue
+                if not candidate.is_file():
+                    continue
+                stat = candidate.stat()
+                if stat.st_size > MAX_DOC_ATTACHMENT_BYTES:
+                    continue
+                if stat.st_mtime < since_epoch - 5:
+                    continue
+            except OSError:
+                continue
+            found.append(str(candidate))
+            if len(found) >= MAX_DOC_ATTACHMENTS:
+                return tuple(sorted(set(found)))
+    return tuple(sorted(set(found))[:MAX_DOC_ATTACHMENTS])
+
+
 class OpenCodeRunner:
     """Run the configured native OI OpenCode agent for one conversation."""
 
@@ -494,6 +581,8 @@ class OpenCodeRunner:
         excerpt: str,
         session_id: str | None = None,
         member_id: str | None = None,
+        bot_name: str = "",
+        bot_id: int | None = None,
     ) -> Reply:
         """Refresh, snapshot, execute, and provenance-stamp one or more repository audits.
 
@@ -510,6 +599,9 @@ class OpenCodeRunner:
                 MR/PR reviews, which never share branch-audit context).
             member_id: Optional author member id; when known, memory rendering
                 is restricted to current participants (plan Phase 3.6).
+            bot_name: Discord display name the agent posts under; grounds the
+                prompt identity block.
+            bot_id: Stable Discord user id of the agent's bot account.
 
         Returns:
             Bounded Reply. OpenCode/process failures have ``ok=False``.
@@ -536,7 +628,8 @@ class OpenCodeRunner:
                 return _review_failure(exc.failure_class)
             if review_target is not None:
                 return await self._run_review_locked(
-                    review_target, author, question, excerpt
+                    review_target, author, question, excerpt,
+                    bot_name=bot_name, bot_id=bot_id,
                 )
             return await self._run_locked(
                 primary_root,
@@ -547,6 +640,8 @@ class OpenCodeRunner:
                 excerpt,
                 session_id,
                 member_id,
+                bot_name=bot_name,
+                bot_id=bot_id,
             )
     async def run_raw_prompt(
         self,
@@ -648,6 +743,8 @@ class OpenCodeRunner:
         excerpt: str,
         session_id: str | None,
         member_id: str | None = None,
+        bot_name: str = "",
+        bot_id: int | None = None,
     ) -> Reply:
         """Execute one audit while holding repository serialization locks."""
         all_roots = [root, *additional_roots]
@@ -717,14 +814,21 @@ class OpenCodeRunner:
                     type(exc).__name__,
                 )
 
+        write_mode = getattr(self._cfg, "write_mode", "read-only")
+        write_dirs = list(getattr(self._cfg, "write_dirs", []) or [])
         prompt_str = build_prompt(
             self._cfg.personality,
             primary_repo=str(root),
             additional_repos=[str(r) for r in additional_roots],
             environment_mode=self._cfg.resolved_environment_mode,
             memory=snapshot,
+            bot_name=bot_name,
+            bot_id=bot_id,
+            write_mode=write_mode,
+            write_dirs=write_dirs,
         )
 
+        run_started = time.time()
         events, stderr_bytes, stderr_sample, returncode, error_class, duration_ms = (
             await self._execute_agent(
                 binary=binary,
@@ -733,6 +837,8 @@ class OpenCodeRunner:
                 prompt_str=prompt_str,
                 prompt=prompt,
                 session_id=session_id,
+                write_mode=write_mode,
+                write_dirs=write_dirs,
             )
         )
         text, returned_session, event_error, text_parts = _select_final_text(events)
@@ -768,11 +874,19 @@ class OpenCodeRunner:
         )
         if error_class:
             return _failure(final_combined_sha, error_class)
+        attachments: tuple[str, ...] = ()
+        if write_mode == "docs-only":
+            attachments = _collect_doc_attachments(
+                [root, *additional_roots],
+                write_dirs=write_dirs,
+                since_epoch=run_started,
+            )
         return Reply(
             text=_bounded_text(text, self._cfg.max_reply_chars),
             sha=final_combined_sha,
             ok=True,
             session_id=returned_session,
+            attachments=attachments,
         )
 
     async def _execute_agent(
@@ -784,12 +898,16 @@ class OpenCodeRunner:
         prompt_str: str,
         prompt: str,
         session_id: str | None,
+        write_mode: str = "read-only",
+        write_dirs: list[str] | tuple[str, ...] | None = None,
     ) -> tuple[list[dict[str, Any]], int, str, int | None, str | None, int]:
         """Spawn one bounded OpenCode audit subprocess and collect telemetry.
 
-        The agent config grants only the existing fail-closed read policy for
-        ``root`` plus explicitly authorized ``additional_roots``; all other
-        tools remain denied (policy.py is the single source of that map).
+        The agent config grants only the fail-closed read policy for ``root``
+        plus explicitly authorized ``additional_roots``; all other tools
+        remain denied unless ``write_mode="docs-only"`` grants .md/.txt
+        edit/write (policy.py is the single source of that map). Reviews
+        always run read-only.
 
         Args:
             binary: Resolved OpenCode executable path.
@@ -798,6 +916,8 @@ class OpenCodeRunner:
             prompt_str: Embedded system prompt.
             prompt: Bounded user prompt written to stdin.
             session_id: Optional OpenCode session to resume.
+            write_mode: ``"read-only"`` or ``"docs-only"``.
+            write_dirs: Optional repo-relative scopes for doc writes.
 
         Returns:
             ``(events, stderr_bytes, stderr_sample, returncode, error_class,
@@ -813,6 +933,8 @@ class OpenCodeRunner:
                 root,
                 prompt_str,
                 additional_repo_roots=additional_roots,
+                write_mode=write_mode,
+                write_dirs=write_dirs,
             ),
             separators=(",", ":"),
         )
@@ -897,6 +1019,8 @@ class OpenCodeRunner:
         author: str,
         question: str,
         excerpt: str,
+        bot_name: str = "",
+        bot_id: int | None = None,
     ) -> Reply:
         """Execute one MR/PR audit against controller-owned base/head snapshots.
 
@@ -913,6 +1037,8 @@ class OpenCodeRunner:
             author: Discord display name.
             question: Latest user question.
             excerpt: Bounded Discord conversation excerpt.
+            bot_name: Discord display name the agent posts under.
+            bot_id: Stable Discord user id of the agent's bot account.
 
         Returns:
             Bounded Reply whose provenance is the MR form
@@ -964,6 +1090,8 @@ class OpenCodeRunner:
                 primary_repo=str(snapshot.head_dir),
                 additional_repos=[str(snapshot.base_dir)],
                 environment_mode=self._cfg.resolved_environment_mode,
+                bot_name=bot_name,
+                bot_id=bot_id,
             )
             events, stderr_bytes, stderr_sample, returncode, error_class, duration_ms = (
                 await self._execute_agent(

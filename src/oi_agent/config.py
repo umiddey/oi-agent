@@ -14,6 +14,7 @@ DEFAULT_SECRETS_PATH = Path.home() / ".config" / "oi" / "secrets.env"
 DEFAULT_PERSONALITY = "Talk like a smart teammate in chat, not a report generator."
 REPLY_DELIVERY_MODES = ("chunked", "single_message")
 ENVIRONMENT_MODES = ("workstation", "server")
+WRITE_MODES = ("read-only", "docs-only")
 DISCORD_MAX_MESSAGE_CHARS = 2_000
 LEGACY_KEYS = {"agent", "llm", "api_key", "base_url", "search_aliases", "provider", "model"}
 
@@ -86,6 +87,8 @@ class Config:
     opencode_steps: int = 30
     opencode_timeout_seconds: int = 900
     environment_mode: str = "workstation"
+    write_mode: str = "read-only"
+    write_dirs: list[str] = field(default_factory=list)
     watches: list[WatchTarget] = field(default_factory=list)
 
     @property
@@ -165,6 +168,44 @@ def _require_int_list(container: dict, key: str) -> list[int]:
     return res
 
 
+def _require_write_dirs(container: dict) -> list[str]:
+    """Read optional repo-relative doc-write scopes.
+
+    Accepts a TOML array of strings or a comma-separated string (CLI
+    convenience). Entries must be relative paths without ``..`` escapes;
+    trailing slashes are stripped. Empty means .md/.txt may be written
+    anywhere in the repo (secrets still denied at the policy layer).
+    """
+    if "write_dirs" not in container:
+        return []
+    value = container["write_dirs"]
+    if isinstance(value, str):
+        items = [p.strip() for p in value.split(",") if p.strip()]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ValueError(
+            "'write_dirs' must be an array of strings or comma-separated string, "
+            f"got {type(value).__name__}"
+        )
+    res: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"items in 'write_dirs' must be non-empty strings, got {item!r}")
+        if item.strip().startswith("/"):
+            raise ValueError(f"write_dirs entries must be repo-relative without '..': {item!r}")
+        norm = item.strip().strip("/")
+        if not norm or norm == ".":
+            raise ValueError(f"invalid write_dirs entry: {item!r}")
+        parts = norm.split("/")
+        if ".." in parts:
+            raise ValueError(f"write_dirs entries must be repo-relative without '..': {item!r}")
+        if any(not p for p in parts):
+            raise ValueError(f"invalid write_dirs entry: {item!r}")
+        res.append(norm)
+    return res
+
+
 def load_config(
     path: Path = DEFAULT_CONFIG_PATH,
     *,
@@ -234,6 +275,8 @@ def load_config(
             "workstation" if legacy_environment_mode
             else _require_string(raw, "environment_mode", "workstation")
         ),
+        write_mode=_require_string(raw, "write_mode", "read-only"),
+        write_dirs=_require_write_dirs(raw),
     )
     for watch in watches_raw:
         if not isinstance(watch, dict):
@@ -310,6 +353,20 @@ def validate_config(cfg: Config) -> None:
             f"environment_mode must be one of {ENVIRONMENT_MODES!r} "
             f"(got {cfg.environment_mode!r})"
         )
+    if cfg.write_mode not in WRITE_MODES:
+        raise ValueError(
+            f"write_mode must be one of {WRITE_MODES!r} (got {cfg.write_mode!r})"
+        )
+    if not isinstance(cfg.write_dirs, list):
+        raise ValueError(f"write_dirs must be a list of strings (got {cfg.write_dirs!r})")
+    for entry in cfg.write_dirs:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(f"write_dirs item must be a non-empty string (got {entry!r})")
+        if entry.strip().startswith("/"):
+            raise ValueError(f"write_dirs entries must be repo-relative without '..': {entry!r}")
+        norm = entry.strip().strip("/")
+        if not norm or norm == "." or ".." in norm.split("/"):
+            raise ValueError(f"write_dirs entries must be repo-relative without '..': {entry!r}")
     for name, minimum in (("max_reply_chars", 200), ("opencode_steps", 1),
                           ("opencode_timeout_seconds", 1)):
         value = getattr(cfg, name)
@@ -409,6 +466,8 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
         f"opencode_steps = {cfg.opencode_steps}",
         f"opencode_timeout_seconds = {cfg.opencode_timeout_seconds}",
         f"environment_mode = {json.dumps(cfg.environment_mode)}",
+        f"write_mode = {json.dumps(cfg.write_mode)}",
+        f"write_dirs = {json.dumps(list(cfg.write_dirs))}",
     ]
     for target in cfg.watches:
         lines.append("")

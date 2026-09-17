@@ -193,3 +193,49 @@ def test_config_set_environment_mode_repairs_legacy_auto(tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert load_config(path).environment_mode == "server"
+
+
+def test_session_limits_load_and_roundtrip(tmp_path):
+    """Older configs gain limits; explicit cap and disabled TTL survive saving."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'opencode_binary = "{_binary()}"\n'
+        '[[watch]]\nchannel_id = 111\nrepo_path = "/srv/repo"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    assert (cfg.max_session_turns, cfg.session_ttl_days) == (30, 7)
+    cfg.max_session_turns = 1
+    cfg.session_ttl_days = 0
+    save_config(cfg, path)
+    back = load_config(path)
+    assert (back.max_session_turns, back.session_ttl_days) == (1, 0)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("max_session_turns", 0),
+    ("session_ttl_days", -1),
+    ("max_session_turns", True),
+    ("session_ttl_days", 1.5),
+    ("max_session_turns", "30"),
+])
+def test_session_limits_reject_invalid_values_without_replacing_config(tmp_path, field, value):
+    """Both TOML input and direct saves reject invalid session policies."""
+    import json
+
+    path = tmp_path / "config.toml"
+    cfg = _valid_config()
+    save_config(cfg, path)
+    before = path.read_bytes()
+    setattr(cfg, field, value)
+    with pytest.raises(ValueError, match=field):
+        save_config(cfg, path)
+    assert path.read_bytes() == before
+    path.write_text(
+        f'{field} = {json.dumps(value)}\n'
+        f'opencode_binary = "{_binary()}"\n'
+        '[[watch]]\nchannel_id = 111\nrepo_path = "/srv/repo"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=field):
+        load_config(path)

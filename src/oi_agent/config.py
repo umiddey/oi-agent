@@ -89,6 +89,8 @@ class Config:
     environment_mode: str = "workstation"
     write_mode: str = "read-only"
     write_dirs: list[str] = field(default_factory=list)
+    max_session_turns: int = 30
+    session_ttl_days: int = 7
     watches: list[WatchTarget] = field(default_factory=list)
 
     @property
@@ -277,6 +279,8 @@ def load_config(
         ),
         write_mode=_require_string(raw, "write_mode", "read-only"),
         write_dirs=_require_write_dirs(raw),
+        max_session_turns=_require_int(raw, "max_session_turns", 30),
+        session_ttl_days=_require_int(raw, "session_ttl_days", 7),
     )
     for watch in watches_raw:
         if not isinstance(watch, dict):
@@ -368,7 +372,8 @@ def validate_config(cfg: Config) -> None:
         if not norm or norm == "." or ".." in norm.split("/"):
             raise ValueError(f"write_dirs entries must be repo-relative without '..': {entry!r}")
     for name, minimum in (("max_reply_chars", 200), ("opencode_steps", 1),
-                          ("opencode_timeout_seconds", 1)):
+                          ("opencode_timeout_seconds", 1), ("max_session_turns", 1),
+                          ("session_ttl_days", 0)):
         value = getattr(cfg, name)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer (got {value!r})")
@@ -468,6 +473,8 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
         f"environment_mode = {json.dumps(cfg.environment_mode)}",
         f"write_mode = {json.dumps(cfg.write_mode)}",
         f"write_dirs = {json.dumps(list(cfg.write_dirs))}",
+        f"max_session_turns = {cfg.max_session_turns}",
+        f"session_ttl_days = {cfg.session_ttl_days}",
     ]
     for target in cfg.watches:
         lines.append("")

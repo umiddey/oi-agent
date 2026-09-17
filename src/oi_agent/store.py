@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS opencode_sessions (
     repo_path TEXT NOT NULL,
     session_id TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
+    turns INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conversation_id, repo_path)
 );
 CREATE INDEX IF NOT EXISTS idx_opencode_sessions_updated
@@ -309,6 +310,9 @@ def _ensure_schema_compatibility(conn: sqlite3.Connection) -> None:
             "ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
         )
         conn.execute("UPDATE member_profiles_v2 SET created_at=updated_at")
+    session_columns = {row[1] for row in conn.execute("PRAGMA table_info(opencode_sessions)")}
+    if "turns" not in session_columns:
+        conn.execute("ALTER TABLE opencode_sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
 
 
 class Store:
@@ -1019,6 +1023,47 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
+    def get_opencode_session_info(self, conversation_id: int, repo_path: str | Path) -> dict | None:
+        """Return bounded session metadata for one canonical conversation/repository pair."""
+        row = self._conn.execute(
+            "SELECT conversation_id, repo_path, session_id, turns, updated_at FROM opencode_sessions "
+            "WHERE conversation_id=? AND repo_path=?",
+            (conversation_id, self._repo_key(repo_path)),
+        ).fetchone()
+        return dict(zip(("conversation_id", "repo_path", "session_id", "turns", "updated_at"), row)) if row else None
+
+    def list_opencode_sessions(self, conversation_id: int | None = None) -> list[dict]:
+        """List session metadata in conversation/repository order, optionally scoped."""
+        query = "SELECT conversation_id, repo_path, session_id, turns, updated_at FROM opencode_sessions"
+        params = () if conversation_id is None else (conversation_id,)
+        if conversation_id is not None:
+            query += " WHERE conversation_id=?"
+        rows = self._conn.execute(query + " ORDER BY conversation_id, repo_path", params)
+        keys = ("conversation_id", "repo_path", "session_id", "turns", "updated_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def forget_opencode_sessions(self, conversation_id: int, repo_path: str | Path | None = None) -> int:
+        """Forget mappings only within the required conversation, optionally for one repository."""
+        if repo_path is None:
+            return self._conn.execute(
+                "DELETE FROM opencode_sessions WHERE conversation_id=?", (conversation_id,)
+            ).rowcount
+        return self._conn.execute(
+            "DELETE FROM opencode_sessions WHERE conversation_id=? AND repo_path=?",
+            (conversation_id, self._repo_key(repo_path)),
+        ).rowcount
+
+    def prune_expired_sessions(self, ttl_days: int) -> int:
+        """Remove idle mappings at the TTL boundary; zero disables expiry."""
+        if isinstance(ttl_days, bool) or not isinstance(ttl_days, int) or ttl_days < 0:
+            raise ValueError("ttl_days must be a non-negative integer")
+        if ttl_days == 0:
+            return 0
+        return self._conn.execute(
+            "DELETE FROM opencode_sessions WHERE updated_at <= ?",
+            (int(time.time()) - ttl_days * 86400,),
+        ).rowcount
+
     def set_opencode_session(self, conversation_id: int, repo_path: str | Path,
                              session_id: str) -> None:
         """Persist one successful OpenCode session mapping.
@@ -1036,6 +1081,8 @@ class Store:
         self._conn.execute(
             "INSERT INTO opencode_sessions(conversation_id,repo_path,session_id,updated_at) "
             "VALUES(?,?,?,?) ON CONFLICT(conversation_id,repo_path) DO UPDATE SET "
+            "turns=CASE WHEN opencode_sessions.session_id=excluded.session_id "
+            "THEN opencode_sessions.turns ELSE 0 END, "
             "session_id=excluded.session_id, updated_at=excluded.updated_at",
             (conversation_id, self._repo_key(repo_path), session_id, int(time.time())),
         )
@@ -1415,6 +1462,12 @@ class Store:
         repo_key = self._repo_key(repo_path)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            batch = self._conn.execute(
+                "SELECT status FROM delivery_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if batch is None or batch[0] == "done":
+                self._conn.execute("COMMIT")
+                return
             self._conn.execute(
                 "UPDATE delivery_batches SET status = 'done', updated_at = ? WHERE batch_id = ?",
                 (now, batch_id),
@@ -1435,8 +1488,10 @@ class Store:
                 if row:
                     conv_id = int(row[0])
                     self._conn.execute(
-                        "INSERT INTO opencode_sessions(conversation_id, repo_path, session_id, updated_at) "
-                        "VALUES(?, ?, ?, ?) ON CONFLICT(conversation_id, repo_path) DO UPDATE SET "
+                        "INSERT INTO opencode_sessions(conversation_id, repo_path, session_id, updated_at, turns) "
+                        "VALUES(?, ?, ?, ?, 1) ON CONFLICT(conversation_id, repo_path) DO UPDATE SET "
+                        "turns = CASE WHEN opencode_sessions.session_id=excluded.session_id "
+                        "THEN opencode_sessions.turns + 1 ELSE 1 END, "
                         "session_id = excluded.session_id, updated_at = excluded.updated_at",
                         (conv_id, repo_key, candidate_session_id.strip(), now),
                     )

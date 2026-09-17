@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -815,7 +816,7 @@ def config_show(
         "discord_token_env", "db_path", "personality", "max_reply_chars",
         "reply_delivery", "opencode_binary", "opencode_model", "opencode_steps",
         "opencode_timeout_seconds", "environment_mode", "write_mode",
-        "write_dirs",
+        "write_dirs", "max_session_turns", "session_ttl_days",
     ):
         console.print(f"{name} = {getattr(cfg, name)}")
     for target in cfg.watches:
@@ -851,7 +852,7 @@ def config_set(
         "personality", "max_reply_chars", "reply_delivery", "discord_token_env",
         "db_path", "opencode_binary", "opencode_model", "opencode_steps",
         "opencode_timeout_seconds", "environment_mode", "write_mode",
-        "write_dirs",
+        "write_dirs", "max_session_turns", "session_ttl_days",
     }
     if key not in allowed:
         console.print(f"[red]unknown key '{key}'[/red]")
@@ -989,6 +990,80 @@ def config_secret(
     secrets.write_text("\n".join(lines) + "\n", encoding="utf-8")
     secrets.chmod(0o600)
     console.print(f"[green]{name} updated[/green]")
+
+
+# ==============================================================================
+# Session Subcommands
+# ==============================================================================
+
+session_app = typer.Typer(help="Inspect and forget OpenCode session mappings.")
+app.add_typer(session_app, name="session")
+
+
+@session_app.command("list")
+def session_list(
+    conversation: int | None = typer.Option(None, "--conversation", min=1),
+    config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c"),
+) -> None:
+    """Display session metadata, optionally limited to one conversation.
+
+    Args:
+        conversation: Positive Discord channel or thread ID to filter by.
+        config: Configuration containing the local state database path.
+    """
+    cfg = _load_or_die(config)
+    store = Store(Path(cfg.db_path).expanduser())
+    try:
+        sessions = store.list_opencode_sessions(conversation)
+        if not sessions:
+            console.print("No OpenCode session mappings found.")
+            return
+        table = Table(title="OpenCode Sessions")
+        table.add_column("Conversation", style="cyan", no_wrap=True)
+        table.add_column("Repo", overflow="fold")
+        table.add_column("Turns", justify="right")
+        table.add_column("Updated (UTC)")
+        table.add_column("Age (seconds)", justify="right")
+        now = time.time()
+        for session in sessions:
+            updated_at = float(session["updated_at"])
+            table.add_row(
+                str(session["conversation_id"]),
+                str(session["repo_path"]),
+                str(session["turns"]),
+                datetime.fromtimestamp(updated_at, UTC).isoformat(timespec="seconds"),
+                str(max(0, int(now - updated_at))),
+            )
+        console.print(table)
+    finally:
+        store.close()
+
+
+@session_app.command("forget")
+def session_forget(
+    conversation: int = typer.Option(..., "--conversation", min=1),
+    repo: Path | None = typer.Option(None, "--repo", help="Repository mapping to forget"),
+    all_repos: bool = typer.Option(False, "--all", help="Forget all repos in this conversation"),
+    config: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", "-c"),
+) -> None:
+    """Forget scoped session mappings so the next mention starts fresh.
+
+    Args:
+        conversation: Required positive Discord channel or thread ID.
+        repo: One repository path; mutually exclusive with all_repos.
+        all_repos: Forget every repo only within the given conversation.
+        config: Configuration containing the local state database path.
+    """
+    if (repo is not None) == all_repos:
+        console.print("[red]must specify exactly one of --repo or --all[/red]")
+        raise typer.Exit(1)
+    cfg = _load_or_die(config)
+    store = Store(Path(cfg.db_path).expanduser())
+    try:
+        count = store.forget_opencode_sessions(conversation, repo)
+        console.print(f"[green]forgot {count} session mapping(s) for conversation {conversation}[/green]")
+    finally:
+        store.close()
 
 
 # ==============================================================================

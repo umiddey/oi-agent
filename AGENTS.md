@@ -41,13 +41,21 @@ uv pip install -e . --force-reinstall --no-deps
   Unsupported, ambiguous, or unresolved references fail honestly and never fall back to auditing the
   current checkout. Review provenance carries exact full base/head SHAs, and
   review sessions are never resumed or stored under a conversation key.
+- Conversation sessions are scoped to `(conversation_id, repo_path)` and rotate
+  before reuse at the completed-delivery cap or idle TTL. `!fresh`/`!new` and
+  `oi session forget` clear mappings only; they never widen permissions, erase
+  behavioral memory, or enable review-session reuse. Bounded current Discord
+  context may still be included. Count each successful delivery batch once;
+  failed or duplicate completions must not advance turns. CLI `--all` is scoped
+  to the required conversation, never a global forget.
 - Never log prompts, repository evidence, replies, model reasoning, credentials,
   or raw JSONL events. Bounded metadata only.
 - Posting is gated by the channel allowlist + per-channel hourly cap + kill
   switch (`oi pause`). Poster is the only Discord sender.
 - SQLite stores only pause/cap state, durable queue/outbox metadata, scope
-  cursors, conversation/repository OpenCode session IDs, and bounded, structured,
-  versioned behavioral memory signals (scoped member profiles, expiring transient
+  cursors, conversation/repository OpenCode session IDs with completed-delivery
+  counts and update timestamps, and bounded, structured, versioned behavioral
+  memory signals (scoped member profiles, expiring transient
   state, team pulse, and agent calibration). Never store prompts, repository evidence,
   reasoning, source message bodies, thread excerpts, or free-form generated text.
 - Bounded outbound reply chunks are stored in the SQLite outbox ONLY until

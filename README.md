@@ -105,6 +105,8 @@ opencode_model = "provider/model"
 opencode_steps = 30
 opencode_timeout_seconds = 900
 environment_mode = "workstation"
+max_session_turns = 30
+session_ttl_days = 7
 
 # 1. Channel-specific watch auditing multiple repositories:
 [[watch]]
@@ -154,11 +156,71 @@ oi config show
 `oi config set environment_mode` validates against `workstation | server` and
 writes atomically; any other value is rejected.
 
+## Conversation sessions
+
 Messages must mention the bot, start with `oi:`, or contain `#oi`, `#audit`, or
 `#bugreport`. Ordinary chatter stays silent. A burst is coalesced into one
-latest-context request, and a conversation resumes its stored OpenCode session.
-Threads have separate sessions from their parent and siblings. A session is
-stored only after a successful OpenCode response and successful Discord post.
+latest-context request. Sessions are scoped to `(conversation, repository)`;
+threads have separate sessions from their parent and siblings.
+
+By default, the next request starts a new OpenCode session once the stored
+session has **30 completed deliveries** or has been idle for **seven days**:
+
+- One fully delivered response batch counts as one turn, regardless of chunk
+  count. Failed runs, incomplete delivery, and duplicate batch completion do not
+  add turns. A replacement session starts at one after its first completed delivery.
+- Idle age is measured from `updated_at`, the last successful completed delivery,
+  not session creation or the latest incoming message. Rotation occurs at
+  `turns >= max_session_turns` or `age >= session_ttl_days * 86400` seconds.
+- Automatic rotation adds a concise notice to the successful final reply.
+  A session mapping is stored only after successful OpenCode execution and
+  complete Discord delivery.
+
+Both limits are global configuration values. The turn cap must be a positive
+integer; TTL must be a nonnegative integer. Set TTL to `0` to disable idle-age
+rotation only (the turn cap still applies):
+
+```bash
+oi config set max_session_turns 30
+oi config set session_ttl_days 7
+oi config set session_ttl_days 0
+```
+
+### Start fresh from Discord
+
+Put `!fresh` or its alias `!new` first, optionally after the bot mention:
+
+```text
+@OI !fresh Check the current API contract.
+@OI !new Why is this migration failing?
+!fresh @OI Audit the latest changes.
+```
+
+Use an actual Discord bot mention in place of `@OI`. The command must be a
+standalone leading token: `!freshness` and `please !fresh` do not reset a session.
+The command is stripped from the prompt input, not persisted as source content.
+It clears the scoped mapping and starts a new OpenCode session, even if the old
+session was still below its limits. Bounded current Discord context may still
+be included; this does not erase Discord history or behavioral memory, or change
+repository permissions. MR/PR reviews remain isolated and never resume or store
+conversation sessions, including when requested with `!fresh`.
+
+### Inspect or forget mappings
+
+```bash
+oi session list
+oi session list --conversation 123456789012345678
+oi session forget --conversation 123456789012345678 --repo /srv/repos/backend-erp
+oi session forget --conversation 123456789012345678 --all
+```
+
+`list` shows session metadata, including completed turns and the last-update
+time/idle age. `forget` requires `--conversation` and exactly one of `--repo` or
+`--all`. Here `--all` means **all repository mappings for that conversation**,
+never other conversations. Forgetting removes mappings only; it makes the next
+request start fresh without deleting Discord history or behavioral memory.
+`oi memory reset-*` and `oi memory prune` do not reset OpenCode sessions.
+
 ## Durable delivery & queue management
 
 OI provides at-least-once message processing with crash and restart recovery:
@@ -258,3 +320,8 @@ uv sync --dev
 uv run pytest
 uv pip install -e . --force-reinstall --no-deps
 ```
+
+After any source change or checkout upgrade, reinstall the package with the
+command above before restarting `oi run` or the daemon; otherwise the installed
+entry point may still run the old build. Restart alone is not a package upgrade.
+For a daemon, reinstall into the environment that provides its `oi` executable.

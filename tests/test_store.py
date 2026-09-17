@@ -9,6 +9,58 @@ from concurrent.futures import ThreadPoolExecutor
 from oi_agent.store import Store
 
 
+def test_session_legacy_migration_and_delivery_counting(tmp_path):
+    """Legacy sessions survive migration and completed batches count exactly once."""
+    db = tmp_path / "state.db"
+    repo = tmp_path / "repo"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE opencode_sessions (conversation_id INTEGER, repo_path TEXT, "
+        "session_id TEXT, updated_at INTEGER, PRIMARY KEY(conversation_id, repo_path))"
+    )
+    conn.execute("INSERT INTO opencode_sessions VALUES (1, ?, 'old', 100)", (str(repo),))
+    conn.commit()
+    conn.close()
+    store = Store(db)
+    assert store.get_opencode_session(1, repo) == "old"
+    assert store.get_opencode_session_info(1, repo)["turns"] == 0
+    for index, session, turns in [(1, "old", 1), (2, "old", 2), (3, "replacement", 1)]:
+        batch = f"session-count-{index}"
+        store.admit_mention_job(index, 1, 1, repo)
+        store.commit_outbox(batch, 1, 1, repo, [index], ["answer"], session)
+        assert store.get_opencode_session_info(1, repo)["turns"] == (0 if index == 1 else index - 1)
+        store.record_chunk_delivery(batch, 0, 100 + index)
+        store.complete_delivery_batch(batch, repo, session)
+        store.complete_delivery_batch(batch, repo, session)
+        assert store.get_opencode_session_info(1, repo)["turns"] == turns
+    store.set_opencode_session(1, repo, "replacement")
+    assert store.get_opencode_session_info(1, repo)["turns"] == 1
+    store.close()
+    store = Store(db)
+    assert store.get_opencode_session_info(1, repo)["turns"] == 1
+    store.forget_opencode_sessions(1)
+    store.complete_delivery_batch("session-count-3", repo, "replacement")
+    assert store.get_opencode_session_info(1, repo) is None
+    store.close()
+
+
+def test_session_prune_exact_idle_boundary_and_disabled_ttl(tmp_path, monkeypatch):
+    """TTL pruning removes only expired sessions and zero preserves every mapping."""
+    monkeypatch.setattr("oi_agent.store.time.time", lambda: 1_000_000)
+    store = Store(tmp_path / "state.db")
+    repo = tmp_path / "repo"
+    store.set_opencode_session(1, repo, "expired")
+    store.set_opencode_session(2, repo, "live")
+    store._conn.execute("UPDATE opencode_sessions SET updated_at=? WHERE conversation_id=1", (1_000_000 - 86400,))
+    store._conn.execute("UPDATE opencode_sessions SET updated_at=? WHERE conversation_id=2", (1_000_001 - 86400,))
+    assert store.prune_expired_sessions(0) == 0
+    assert store.prune_expired_sessions(1) == 1
+    assert store.get_opencode_session(1, repo) is None
+    assert store.get_opencode_session(2, repo) == "live"
+    assert store.prune_expired_sessions(1) == 0
+    store.close()
+
+
 def test_existing_profile_schema_gets_additive_created_at_migration(tmp_path):
     """Existing v2 databases gain the column required by current profile writes."""
     db = tmp_path / "state.db"

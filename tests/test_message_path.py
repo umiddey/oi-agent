@@ -374,3 +374,255 @@ async def test_runner_receives_bot_identity(tmp_path, monkeypatch):
     await asyncio.sleep(0.05)
 
     assert captured == {"bot_name": "UltronBot", "bot_id": 99}
+
+
+async def _process_messages(watcher, channel, *messages):
+    """Run admitted messages through the durable processor without worker timing.
+
+    Args:
+        watcher (OIWatcher): Watcher backed by an isolated real store.
+        channel (FakeChannel): Message source channel or thread.
+        messages (FakeMessage): Messages admitted to this single batch.
+
+    Returns:
+        None: Processing and immediate delivery have completed.
+    """
+    watcher._channel_cache[channel.id] = channel
+    target, owner = watcher._resolve_target(channel.id, channel)
+    for message in messages:
+        watcher._store.admit_mention_job(
+            source_message_id=message.id,
+            conversation_id=channel.id,
+            owner_channel_id=owner,
+            repo_path=target.primary_repo,
+        )
+    conversation_id, jobs = watcher._store.claim_next_conversation_jobs()
+    await watcher._process_conversation_jobs(conversation_id, jobs)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["<@99> !fresh inspect", "<@!99> !new inspect", "!fresh <@99> inspect"],
+)
+@pytest.mark.asyncio
+async def test_fresh_command_clears_before_run_and_resumes_delivered_replacement(
+    tmp_path, monkeypatch, content,
+):
+    """Reset tokens disappear from context; only a delivered replacement resumes."""
+    watcher = _watcher(tmp_path)
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._store.set_opencode_session(111, repo, "old")
+    watcher._store.set_opencode_session(222, repo, "other-conversation")
+    channel = FakeChannel(111)
+    first = FakeMessage(1, channel, FakeAuthor(7), content, [FakeMention(99)])
+    channel._history = [first]
+    calls, posted = [], []
+
+    async def fake_run(target, author, question, excerpt, session_id=None, **kwargs):
+        """Capture clean prompt context and the durable mapping at execution time."""
+        calls.append((session_id, watcher._store.get_opencode_session(111, repo)))
+        assert "!fresh" not in question + excerpt
+        assert "!new" not in question + excerpt
+        assert "inspect" in question
+        return Reply("answer", "sha", session_id="replacement")
+
+    async def fake_deliver(self, **kwargs):
+        """Observe that replacement state is not committed before delivery."""
+        if not posted:
+            assert watcher._store.get_opencode_session(111, repo) is None
+        posted.append(kwargs["chunk"])
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, first)
+    assert first.content == content
+    assert watcher._store.get_opencode_session_info(111, repo)["turns"] == 1
+    second = FakeMessage(2, channel, FakeAuthor(7), "<@99> inspect again", [FakeMention(99)])
+    channel._history.append(second)
+    await _process_messages(watcher, channel, second)
+    assert calls == [(None, None), ("replacement", "replacement")]
+    assert posted == ["answer", "answer"]
+    assert watcher._store.get_opencode_session_info(111, repo)["turns"] == 2
+    assert watcher._store.get_opencode_session(222, repo) == "other-conversation"
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["<@99> explain !fresh", "<@99> !freshness inspect", "<@99> !new-session", "<@7> !fresh <@99> inspect"],
+)
+@pytest.mark.asyncio
+async def test_noncommand_text_keeps_current_session(tmp_path, monkeypatch, content):
+    """Later words, longer tokens, and another user's mention cannot request reset."""
+    watcher = _watcher(tmp_path)
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._store.set_opencode_session(111, repo, "current")
+    channel = FakeChannel(111)
+    message = FakeMessage(1, channel, FakeAuthor(7), content, [FakeMention(99), FakeMention(7)])
+    channel._history = [message]
+    calls = []
+
+    async def fake_run(target, author, question, excerpt, session_id=None, **kwargs):
+        """Preserve literal user text when it is not a leading command token."""
+        calls.append(session_id)
+        assert "!" in question
+        return Reply("answer", "sha", session_id="current")
+
+    async def fake_deliver(self, **kwargs):
+        """Require no rotation notice on an ordinary resumed turn."""
+        assert kwargs["chunk"] == "answer"
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, message)
+    assert calls == ["current"]
+
+
+@pytest.mark.asyncio
+async def test_earlier_burst_reset_applies_to_latest_question(tmp_path, monkeypatch):
+    """An earlier admitted reset survives coalescing but leaves the latest question."""
+    watcher = _watcher(tmp_path)
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._store.set_opencode_session(111, repo, "old")
+    channel = FakeChannel(111)
+    first = FakeMessage(1, channel, FakeAuthor(7), "<@99> !new old", [FakeMention(99)])
+    second = FakeMessage(2, channel, FakeAuthor(7), "<@99> latest", [FakeMention(99)])
+    channel._history = [first, second]
+    calls = []
+
+    async def fake_run(target, author, question, excerpt, session_id=None, **kwargs):
+        """Capture the coalesced fresh run with sanitized context."""
+        calls.append((question, session_id))
+        assert "!new" not in excerpt
+        return Reply("answer", "sha", session_id="new")
+
+    async def fake_deliver(self, **kwargs):
+        """Accept one coalesced batch."""
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, first, second)
+    assert calls == [("@ultron (user id 99) latest", None)]
+    assert watcher._store.get_opencode_session_info(111, repo)["turns"] == 1
+
+
+@pytest.mark.parametrize(
+    "turns,age,ttl,rotates",
+    [(30, 0, 7, True), (29, 7 * 86400, 7, True), (29, 7 * 86400 - 1, 7, False), (29, 9 * 86400, 0, False)],
+)
+@pytest.mark.asyncio
+async def test_session_rotation_boundaries(tmp_path, monkeypatch, turns, age, ttl, rotates):
+    """Rotate at cap or exact TTL; disabled TTL and below-boundary turns resume."""
+    watcher = _watcher(tmp_path)
+    watcher._cfg.session_ttl_days = ttl
+    watcher._cfg.max_reply_chars = 50
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._store.set_opencode_session(111, repo, "old")
+    now = int(discord_client.time.time())
+    watcher._store._conn.execute(
+        "UPDATE opencode_sessions SET turns=?, updated_at=? WHERE conversation_id=111",
+        (turns, now - age),
+    )
+    watcher._store._conn.commit()
+    monkeypatch.setattr(discord_client.time, "time", lambda: now)
+    channel = FakeChannel(111)
+    message = FakeMessage(1, channel, FakeAuthor(7), "<@99> inspect", [FakeMention(99)])
+    channel._history = [message]
+    calls, posted = [], []
+    answer = "Verified repository answer. " * 3
+
+    async def fake_run(target, author, question, excerpt, session_id=None, **kwargs):
+        """Inspect pre-run mapping and return the session actually executed."""
+        calls.append(session_id)
+        assert watcher._store.get_opencode_session(111, repo) == (None if rotates else "old")
+        return Reply(answer, "sha", session_id="replacement" if rotates else "old")
+
+    async def fake_deliver(self, **kwargs):
+        """Capture every chunk to ensure exactly one notice survives splitting."""
+        posted.append(kwargs["chunk"])
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, message)
+    assert calls == [None if rotates else "old"]
+    assert " ".join(posted).count("Started a fresh session") == int(rotates)
+    info = watcher._store.get_opencode_session_info(111, repo)
+    assert info["session_id"] == ("replacement" if rotates else "old")
+    assert info["turns"] == (1 if rotates else turns + 1)
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.asyncio
+async def test_reset_failure_stays_fresh_without_rotation_notice(tmp_path, monkeypatch, fresh):
+    """A failed rotated/explicitly reset run cannot restore old state or claim success."""
+    watcher = _watcher(tmp_path)
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._cfg.max_session_turns = 1
+    watcher._store.set_opencode_session(111, repo, "old")
+    watcher._store._conn.execute("UPDATE opencode_sessions SET turns=1")
+    watcher._store._conn.commit()
+    channel = FakeChannel(111)
+    content = "<@99> !fresh inspect" if fresh else "<@99> inspect"
+    message = FakeMessage(1, channel, FakeAuthor(7), content, [FakeMention(99)])
+    channel._history = [message]
+    calls, posted = [], []
+
+    async def fake_run(*args, session_id=None, **kwargs):
+        """Return a protocol failure twice, exercising the existing fresh retry."""
+        calls.append(session_id)
+        assert watcher._store.get_opencode_session(111, repo) is None
+        return Reply("failure", "sha", ok=False, error_class="protocol_empty_final_answer")
+
+    async def fake_deliver(self, **kwargs):
+        """Observe the final failure without an automatic-rotation success notice."""
+        posted.append(kwargs["chunk"])
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(watcher._runner, "run", fake_run)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, message)
+    assert calls == [None, None]
+    assert posted == ["failure"]
+    assert watcher._store.get_opencode_session(111, repo) is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_review_stays_isolated_from_conversation_sessions(tmp_path, monkeypatch):
+    """A reset review follows real review dispatch and leaves no resumable mapping."""
+    from oi_agent.opencode import runner
+
+    watcher = _watcher(tmp_path)
+    repo = watcher._cfg.watches[0].repo_path
+    watcher._store.set_opencode_session(111, repo, "old")
+    channel = FakeChannel(111)
+    message = FakeMessage(1, channel, FakeAuthor(7), "<@99> !fresh review PR #188", [FakeMention(99)])
+    channel._history = [message]
+    review_target = object()
+    posted = []
+
+    def resolve_review(question, repo_paths):
+        """Recognize the review only after the control token is stripped."""
+        assert "!fresh" not in question
+        assert "review PR #188" in question
+        return review_target
+
+    async def review_only(target, author, question, excerpt, *, bot_name, bot_id):
+        """Model the isolated review result without accepting any resume argument."""
+        assert watcher._store.get_opencode_session(111, repo) is None
+        assert "!fresh" not in excerpt
+        return Reply("review answer", "sha", session_id=None)
+
+    async def fake_deliver(self, **kwargs):
+        """Deliver the review without creating branch-audit state."""
+        posted.append(kwargs["chunk"])
+        return DeliveryResult(ok=True, discord_message_id=999)
+
+    monkeypatch.setattr(runner, "resolve_review_target", resolve_review)
+    monkeypatch.setattr(watcher._runner, "_run_review_locked", review_only)
+    monkeypatch.setattr(discord_client.Poster, "deliver_chunk", fake_deliver)
+    await _process_messages(watcher, channel, message)
+    assert posted == ["review answer"]
+    assert watcher._store.get_opencode_session(111, repo) is None

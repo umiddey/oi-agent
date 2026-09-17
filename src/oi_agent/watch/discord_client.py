@@ -42,6 +42,24 @@ MAX_TRACKED_REFLECTION_DELIVERIES = 500
 
 # Raw Discord user-mention markup (<@id> and <@!id> nickname form).
 _USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_FRESH_COMMAND_RE = re.compile(r"^\s*(?:(<@!?(\d+)>)\s*)?!(?:fresh|new)(?=\s|$)\s*", re.IGNORECASE)
+
+
+def _strip_fresh_command(content: str, bot_user_id: int) -> tuple[str, bool]:
+    """Remove a leading session command, optionally following this bot's mention.
+
+    Args:
+        content (str): Raw Discord message content, never modified in place.
+        bot_user_id (int): Bot identity accepted before the command.
+
+    Returns:
+        tuple[str, bool]: Prompt content and whether a command was consumed.
+    """
+    match = _FRESH_COMMAND_RE.match(content)
+    if match is None or (match.group(2) and int(match.group(2)) != bot_user_id):
+        return content, False
+    mention = f"{match.group(1)} " if match.group(1) else ""
+    return (mention + content[match.end():]).rstrip(), True
 
 
 def _resolve_user_mentions(content: str, mentions: list[Any] | None) -> str:
@@ -86,7 +104,7 @@ def _resolve_user_mentions(content: str, mentions: list[Any] | None) -> str:
     return _USER_MENTION_RE.sub(_sub, content)
 
 
-def _message_evidence_line(message: discord.Message) -> str:
+def _message_evidence_line(message: discord.Message, bot_user_id: int = 0) -> str:
     """Render message text and attachment metadata for model context.
 
     Attachment URLs and embed descriptions are retained so multimodal
@@ -94,12 +112,16 @@ def _message_evidence_line(message: discord.Message) -> str:
 
     Args:
         message (discord.Message): Incoming Discord message.
+        bot_user_id (int): Bot identity used to strip session command tokens.
 
     Returns:
         str: Context line for the conversation history.
     """
+    content = (message.content or "").strip()
+    if not getattr(message.author, "bot", False):
+        content, _ = _strip_fresh_command(content, bot_user_id)
     body = _resolve_user_mentions(
-        (message.content or "").strip(),
+        content,
         list(getattr(message, "mentions", None) or ()),
     )
     evidence: list[str] = []
@@ -119,12 +141,15 @@ def _message_evidence_line(message: discord.Message) -> str:
     return (body or "(attachment/embed)")[:600]
 
 
-async def _thread_excerpt(channel: discord.abc.Messageable, limit: int = EXCERPT_LIMIT) -> str:
+async def _thread_excerpt(
+    channel: discord.abc.Messageable, limit: int = EXCERPT_LIMIT, *, bot_user_id: int = 0
+) -> str:
     """Fetch bounded conversation excerpt with attachments and embeds.
 
     Args:
         channel (discord.abc.Messageable): Discord channel or thread.
         limit (int): Maximum messages to retrieve.
+        bot_user_id (int): Bot identity used to strip session command tokens.
 
     Returns:
         str: Chronological conversation history string.
@@ -139,19 +164,19 @@ async def _thread_excerpt(channel: discord.abc.Messageable, limit: int = EXCERPT
                     raw_messages.append(m)
                 for msg in reversed(raw_messages):
                     author = getattr(msg.author, "display_name", "unknown")
-                    line = _message_evidence_line(msg)
+                    line = _message_evidence_line(msg, bot_user_id)
                     lines.append(f"[{msg.id}] {author}: {line}")
             elif asyncio.iscoroutine(history_iter):
                 raw_messages = await history_iter
                 for msg in reversed(raw_messages):
                     author = getattr(msg.author, "display_name", "unknown")
-                    line = _message_evidence_line(msg)
+                    line = _message_evidence_line(msg, bot_user_id)
                     lines.append(f"[{msg.id}] {author}: {line}")
         elif hasattr(channel, "_history"):
             raw_messages = list(getattr(channel, "_history", []))[-limit:]
             for msg in raw_messages:
                 author = getattr(msg.author, "display_name", "unknown")
-                line = _message_evidence_line(msg)
+                line = _message_evidence_line(msg, bot_user_id)
                 lines.append(f"[{msg.id}] {author}: {line}")
     except Exception:
         logger.warning(
@@ -786,11 +811,33 @@ class OIWatcher(discord.Client):
 
             author_name = getattr(trigger_message.author, "display_name", "unknown")
             author_id = getattr(trigger_message.author, "id", 0)
+            command_bot_id = target.bot_user_id or (self.user.id if self.user else 0)
+            prompt_content, fresh_requested = _strip_fresh_command(
+                trigger_message.content or "", command_bot_id
+            )
+            # A reset in any admitted burst message applies to the coalesced run;
+            # old excerpt-only commands never reset a later conversation turn.
+            for source_id in source_message_ids[:-1]:
+                if fresh_requested:
+                    break
+                try:
+                    if hasattr(ch, "fetch_message"):
+                        source = await ch.fetch_message(source_id)
+                    else:
+                        source = next(
+                            (m for m in getattr(ch, "_history", []) if m.id == source_id), None
+                        )
+                except discord.HTTPException:
+                    continue
+                if source is not None:
+                    _, fresh_requested = _strip_fresh_command(
+                        source.content or "", command_bot_id
+                    )
             question = _resolve_user_mentions(
-                trigger_message.content or "",
+                prompt_content,
                 list(getattr(trigger_message, "mentions", None) or ()),
             )
-            excerpt = await _thread_excerpt(ch)
+            excerpt = await _thread_excerpt(ch, bot_user_id=command_bot_id)
             # Ground-truth self identity for the prompt: the display name the
             # bot actually posts under in this conversation (guild nickname
             # aware) plus its stable user id.
@@ -824,7 +871,21 @@ class OIWatcher(discord.Client):
                 # member id so only current participants reach the prompt.
                 participant_id = str(author_id) if author_id else None
                 try:
-                    session_id = self._store.get_opencode_session(conversation_id, repo_path)
+                    session_info = self._store.get_opencode_session_info(conversation_id, repo_path)
+                    rotation_notice = ""
+                    if fresh_requested:
+                        self._store.clear_opencode_session(conversation_id, repo_path)
+                        session_info = None
+                    elif session_info is not None:
+                        at_turn_cap = session_info["turns"] >= self._cfg.max_session_turns
+                        ttl_days = self._cfg.session_ttl_days
+                        expired = ttl_days > 0 and time.time() - session_info["updated_at"] >= ttl_days * 86400
+                        if at_turn_cap or expired:
+                            self._store.clear_opencode_session(conversation_id, repo_path)
+                            session_info = None
+                            reason = "turn limit reached" if at_turn_cap else "idle session expired"
+                            rotation_notice = f"Started a fresh session ({reason})."
+                    session_id = session_info["session_id"] if session_info else None
                     reply = await self._runner.run(
                         target,
                         author_name,
@@ -870,7 +931,11 @@ class OIWatcher(discord.Client):
                         pass
 
                 reply_cap = self._cfg.max_reply_chars if self._cfg else 2000
-                chunks = split_message(reply.text, reply_cap) if reply.text else ["(no response generated)"]
+                response_text = reply.text
+                if reply.ok and rotation_notice:
+                    answer_cap = max(0, reply_cap - len(rotation_notice) - 2)
+                    response_text = f"{response_text[:answer_cap].rstrip()}\n\n{rotation_notice}".strip()
+                chunks = split_message(response_text, reply_cap) if response_text else ["(no response generated)"]
                 batch_id = uuid.uuid4().hex
                 candidate_session_id = reply.session_id if reply.ok else None
 

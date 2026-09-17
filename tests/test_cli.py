@@ -1373,3 +1373,133 @@ def test_migrate_legacy_success_mentions_table_drop(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "migrated 3 legacy profile(s)" in result.output
     assert "legacy tables were dropped" in result.output
+
+
+def test_config_set_session_limits_roundtrip(tmp_path):
+    """CLI persists the turn cap and disabled TTL, rejecting unsafe replacements."""
+    cfg_path, _ = _watch_config(tmp_path)
+    for key, value in (("max_session_turns", "12"), ("session_ttl_days", "0")):
+        result = runner.invoke(app, ["config", "set", key, value, "--config", str(cfg_path)])
+        assert result.exit_code == 0, result.output
+    cfg = cli.load_config(cfg_path)
+    assert (cfg.max_session_turns, cfg.session_ttl_days) == (12, 0)
+    shown = runner.invoke(app, ["config", "show", "--config", str(cfg_path)])
+    assert shown.exit_code == 0, shown.output
+    assert "max_session_turns = 12" in shown.output
+    assert "session_ttl_days = 0" in shown.output
+    before = cfg_path.read_bytes()
+    for key, value in (("max_session_turns", "0"), ("session_ttl_days", "-1")):
+        bad = runner.invoke(app, ["config", "set", key, value, "--config", str(cfg_path)])
+        assert bad.exit_code != 0
+        assert cfg_path.read_bytes() == before
+
+
+def _session_config(tmp_path):
+    """Create an isolated CLI config and session-state database path."""
+    cfg_path, repo = _watch_config(tmp_path)
+    db_path = tmp_path / "sessions.db"
+    result = runner.invoke(app, [
+        "config", "set", "db_path", str(db_path), "--config", str(cfg_path),
+    ])
+    assert result.exit_code == 0, result.output
+    return cfg_path, repo, db_path
+
+
+def test_session_list_metadata_filter_and_empty(tmp_path, monkeypatch):
+    """Session listing exposes accurate metadata without session history or IDs."""
+    cfg_path, repo, db_path = _session_config(tmp_path)
+    empty = runner.invoke(app, ["session", "list", "--config", str(cfg_path)])
+    assert empty.exit_code == 0, empty.output
+    assert "No OpenCode session mappings" in empty.output
+    store = Store(db_path)
+    try:
+        store.set_opencode_session(111, repo, "private-session-one")
+        store.set_opencode_session(222, repo, "private-session-two")
+        store._conn.execute(
+            "UPDATE opencode_sessions SET turns=17, updated_at=? WHERE conversation_id=111",
+            (1_700_000_000,),
+        )
+    finally:
+        store.close()
+    monkeypatch.setattr(cli.time, "time", lambda: 1_700_000_065)
+    monkeypatch.setattr(cli, "console", cli.Console(width=240))
+    result = runner.invoke(app, [
+        "session", "list", "--conversation", "111", "--config", str(cfg_path),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "111" in result.output
+    assert "222" not in result.output
+    assert str(repo.resolve()) in result.output
+    assert "17" in result.output
+    assert "2023-11-14T22:13:20+00:00" in result.output
+    assert "65" in result.output
+    assert "private-session" not in result.output
+    all_sessions = runner.invoke(app, ["session", "list", "--config", str(cfg_path)])
+    assert all_sessions.exit_code == 0, all_sessions.output
+    assert "111" in all_sessions.output and "222" in all_sessions.output
+
+
+def test_session_forget_is_scoped_to_conversation_and_repo(tmp_path):
+    """Forgetting one repo or all repos never affects another conversation."""
+    cfg_path, repo, db_path = _session_config(tmp_path)
+    other_repo = tmp_path / "other-repo"
+    store = Store(db_path)
+    try:
+        store.set_opencode_session(111, repo, "one")
+        store.set_opencode_session(111, other_repo, "two")
+        store.set_opencode_session(222, repo, "three")
+    finally:
+        store.close()
+    result = runner.invoke(app, [
+        "session", "forget", "--conversation", "111", "--repo", str(repo),
+        "--config", str(cfg_path),
+    ])
+    assert result.exit_code == 0, result.output
+    store = Store(db_path)
+    try:
+        assert store.get_opencode_session(111, repo) is None
+        assert store.get_opencode_session(111, other_repo) == "two"
+        assert store.get_opencode_session(222, repo) == "three"
+    finally:
+        store.close()
+    result = runner.invoke(app, [
+        "session", "forget", "--conversation", "111", "--all", "--config", str(cfg_path),
+    ])
+    assert result.exit_code == 0, result.output
+    store = Store(db_path)
+    try:
+        assert store.list_opencode_sessions(111) == []
+        assert store.get_opencode_session(222, repo) == "three"
+    finally:
+        store.close()
+    repeated = runner.invoke(app, [
+        "session", "forget", "--conversation", "111", "--all", "--config", str(cfg_path),
+    ])
+    assert repeated.exit_code == 0, repeated.output
+    assert "forgot 0" in repeated.output
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--all"],
+    ["--conversation", "111"],
+    ["--conversation", "111", "--repo", "/repo", "--all"],
+    ["--conversation", "0", "--all"],
+    ["--conversation", "-1", "--all"],
+])
+def test_session_forget_invalid_scope_never_changes_mappings(tmp_path, arguments):
+    """Missing, ambiguous, and non-positive scopes cannot delete stored sessions."""
+    cfg_path, repo, db_path = _session_config(tmp_path)
+    store = Store(db_path)
+    try:
+        store.set_opencode_session(111, repo, "keep-me")
+    finally:
+        store.close()
+    result = runner.invoke(app, [
+        "session", "forget", *arguments, "--config", str(cfg_path),
+    ])
+    assert result.exit_code != 0
+    store = Store(db_path)
+    try:
+        assert store.get_opencode_session(111, repo) == "keep-me"
+    finally:
+        store.close()

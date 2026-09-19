@@ -816,7 +816,7 @@ def config_show(
         "discord_token_env", "db_path", "personality", "max_reply_chars",
         "reply_delivery", "opencode_binary", "opencode_model", "opencode_steps",
         "opencode_timeout_seconds", "environment_mode", "write_mode",
-        "write_dirs", "max_session_turns", "session_ttl_days",
+        "write_dirs", "max_session_turns", "session_ttl_days", "reminder_channel_id",
     ):
         console.print(f"{name} = {getattr(cfg, name)}")
     for target in cfg.watches:
@@ -852,7 +852,7 @@ def config_set(
         "personality", "max_reply_chars", "reply_delivery", "discord_token_env",
         "db_path", "opencode_binary", "opencode_model", "opencode_steps",
         "opencode_timeout_seconds", "environment_mode", "write_mode",
-        "write_dirs", "max_session_turns", "session_ttl_days",
+        "write_dirs", "max_session_turns", "session_ttl_days", "reminder_channel_id",
     }
     if key not in allowed:
         console.print(f"[red]unknown key '{key}'[/red]")

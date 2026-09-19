@@ -24,11 +24,16 @@ from ..config import Config, WatchTarget
 from ..opencode.runner import OpenCodeRunner, scope_id_for_target
 from ..poster import Poster, split_message
 from ..reflection.engine import ReflectionEngine
+from ..reminders import (
+    COMPLETION_EMOJIS,
+    format_interval,
+    parse_reminder_declaration,
+    render_reminder,
+)
 from ..store import Store
 from .gate import Action, evaluate
 
 logger = logging.getLogger(__name__)
-
 EXCERPT_LIMIT = 40
 BURST_QUIET_SECONDS = 8.0
 MAX_CONCURRENT_AUDITS_PER_CHANNEL = 2
@@ -36,6 +41,7 @@ LEASE_DURATION_SECONDS = 60
 LEASE_RENEW_INTERVAL_SECONDS = 20
 RETRY_DELAY_SECONDS = 10
 MAX_ATTEMPTS = 5
+REMINDER_POLL_SECONDS = 60
 # Documented bound for the in-memory reflection idempotence FIFO (finding B8).
 MAX_TRACKED_REFLECTION_DELIVERIES = 500
 
@@ -225,6 +231,7 @@ class OIWatcher(discord.Client):
         intents.messages = True
         intents.message_content = True
         intents.guilds = True
+        intents.reactions = True
         super().__init__(intents=intents)
         self._cfg = cfg
         self._store = store
@@ -235,6 +242,7 @@ class OIWatcher(discord.Client):
         self._conversation_last_event: dict[int, float] = {}
         self._channel_cache: dict[int, discord.abc.Messageable] = {}
         self._worker_task: asyncio.Task | None = None
+        self._reminder_task: asyncio.Task | None = None
         self._stopping = False
         self._work_event = asyncio.Event()
         self._active_conversation_tasks: dict[int, asyncio.Task] = {}
@@ -342,6 +350,10 @@ class OIWatcher(discord.Client):
             self._worker_task = asyncio.create_task(self._durable_worker_loop())
         if self._reflection_worker_task is None or self._reflection_worker_task.done():
             self._reflection_worker_task = asyncio.create_task(self._reflection_worker_loop())
+        if self._cfg.reminder_channel_id > 0 and (
+            self._reminder_task is None or self._reminder_task.done()
+        ):
+            self._reminder_task = asyncio.create_task(self._reminder_worker_loop())
         try:
             await self._reconcile_targets()
         except Exception:
@@ -529,6 +541,163 @@ class OIWatcher(discord.Client):
         if admitted_any:
             self._work_event.set()
 
+    def _reminder_bot_id(self) -> int:
+        """Return the configured OI bot ID for the reminder channel."""
+        target = self._cfg.target_for_channel(self._cfg.reminder_channel_id)
+        return int(target.bot_user_id if target and target.bot_user_id else (self.user.id if self.user else 0))
+
+    @staticmethod
+    def _has_completion_reaction(message: discord.Message) -> bool:
+        """Return whether a Discord message currently has a completion tick."""
+        return any(
+            str(getattr(getattr(reaction, "emoji", None), "name", getattr(reaction, "emoji", "")))
+            in COMPLETION_EMOJIS
+            and int(getattr(reaction, "count", 0)) > 0
+            for reaction in getattr(message, "reactions", [])
+        )
+
+    async def _fetch_reminder_channel(self) -> discord.abc.Messageable | None:
+        """Resolve the configured reminder channel through the gateway cache/API."""
+        channel_id = self._cfg.reminder_channel_id
+        if channel_id <= 0:
+            return None
+        channel = self._channel_cache.get(channel_id) or self.get_channel(channel_id)
+        if channel is not None:
+            self._channel_cache[channel_id] = channel
+            return channel
+        try:
+            channel = await self.fetch_channel(channel_id)
+        except Exception:
+            logger.warning("[reminder] cannot fetch configured channel", exc_info=True)
+            return None
+        if channel is not None:
+            self._channel_cache[channel_id] = channel
+        return channel
+
+    async def _process_reminder_message(self, message: discord.Message) -> bool:
+        """Admit a valid reminder declaration and bypass the OpenCode audit path."""
+        if message.channel.id != self._cfg.reminder_channel_id:
+            return False
+        declaration = parse_reminder_declaration(
+            message.content or "",
+            [getattr(member, "id", 0) for member in getattr(message, "mentions", [])],
+            self._reminder_bot_id(),
+        )
+        if declaration is None:
+            return False
+        self._store.update_scope_cursor(str(message.channel.id), message.channel.id, message.id)
+        inserted = self._store.create_reminder(
+            source_message_id=message.id,
+            channel_id=message.channel.id,
+            creator_id=getattr(message.author, "id", 0),
+            target_member_ids=declaration.target_member_ids,
+            interval_seconds=declaration.interval_seconds,
+        )
+        if inserted:
+            target, owner = self._resolve_target(message.channel.id, message.channel)
+            if target is not None and owner is not None:
+                acknowledgement = (
+                    f"✅ Reminder set for every {format_interval(declaration.interval_seconds)}. "
+                    "I’ll keep reminding here until the original message gets a completion tick."
+                )
+                result = await Poster(self._cfg, self._store, self._token).deliver_chunk(
+                    channel_id=message.channel.id,
+                    target_channel_id=owner,
+                    chunk=acknowledgement,
+                    nonce=f"ack-{message.id}",
+                    reply_to_message_id=message.id,
+                )
+                if not result.ok:
+                    logger.warning("[reminder] acknowledgement delivery failed for %s", message.id)
+        logger.info("[reminder] declaration %s inserted=%s", message.id, inserted)
+        return True
+
+    async def _reminder_worker_loop(self) -> None:
+        """Deliver due reminders and persist the next schedule after success."""
+        while not self._stopping:
+            try:
+                for reminder in self._store.claim_due_reminders():
+                    source_id = int(reminder["source_message_id"])
+                    channel = await self._fetch_reminder_channel()
+                    source = None
+                    if channel is not None and hasattr(channel, "fetch_message"):
+                        try:
+                            source = await channel.fetch_message(source_id)
+                        except Exception:
+                            source = None
+                    if source is None:
+                        self._store.release_reminder(source_id, retry_at=int(time.time()) + 60)
+                        continue
+                    if self._has_completion_reaction(source):
+                        self._store.set_reminder_completed(source_id, True)
+                        continue
+                    declaration = parse_reminder_declaration(
+                        source.content or "",
+                        [getattr(member, "id", 0) for member in getattr(source, "mentions", [])],
+                        self._reminder_bot_id(),
+                    )
+                    if declaration is None:
+                        self._store.release_reminder(source_id, retry_at=int(time.time()) + 3_600)
+                        continue
+                    target, owner = self._resolve_target(channel.id, channel)
+                    if target is None or owner is None:
+                        self._store.release_reminder(source_id, retry_at=int(time.time()) + 60)
+                        continue
+                    next_due = int(reminder["next_due_at"])
+                    body = render_reminder(
+                        declaration.task_text,
+                        source_id,
+                        channel.id,
+                        reminder["target_member_ids"],
+                        next_due,
+                    )
+                    nonce = f"r-{uuid.uuid5(uuid.NAMESPACE_URL, f'{source_id}:{next_due}').hex[:20]}"
+                    result = await Poster(self._cfg, self._store, self._token).deliver_chunk(
+                        channel_id=channel.id,
+                        target_channel_id=owner,
+                        chunk=body,
+                        nonce=nonce,
+                        reply_to_message_id=source_id,
+                    )
+                    if result.ok:
+                        self._store.advance_reminder(source_id)
+                    else:
+                        self._store.release_reminder(source_id, retry_at=int(time.time()) + 60)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[reminder] worker pass failed")
+            try:
+                await asyncio.sleep(REMINDER_POLL_SECONDS)
+            except asyncio.CancelledError:
+                break
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """Complete a reminder when a human adds a configured tick reaction."""
+        if str(getattr(payload.emoji, "name", payload.emoji)) not in COMPLETION_EMOJIS:
+            return
+        reminder = self._store.get_reminder(payload.message_id)
+        if reminder is None or int(payload.user_id) == self._reminder_bot_id():
+            return
+        self._store.set_reminder_completed(payload.message_id, True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        """Reopen a reminder when its final completion tick is removed."""
+        if str(getattr(payload.emoji, "name", payload.emoji)) not in COMPLETION_EMOJIS:
+            return
+        reminder = self._store.get_reminder(payload.message_id)
+        if reminder is None or int(payload.user_id) == self._reminder_bot_id():
+            return
+        channel = await self._fetch_reminder_channel()
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            source = await channel.fetch_message(payload.message_id)
+        except Exception:
+            return
+        if not self._has_completion_reaction(source):
+            self._store.set_reminder_completed(payload.message_id, False)
+
     async def on_message(self, message: discord.Message) -> None:
         """Admit explicit mention jobs and advance scope cursors from incoming messages.
 
@@ -538,6 +707,8 @@ class OIWatcher(discord.Client):
         Returns:
             None: No return value.
         """
+        if await self._process_reminder_message(message):
+            return
         target, owner = self._resolve_target(message.channel.id, message.channel)
         if target is None or owner is None:
             return
@@ -1112,6 +1283,12 @@ class OIWatcher(discord.Client):
         """
         self._stopping = True
         self._work_event.set()
+        if self._reminder_task is not None and not self._reminder_task.done():
+            self._reminder_task.cancel()
+            try:
+                await self._reminder_task
+            except asyncio.CancelledError:
+                pass
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
             try:

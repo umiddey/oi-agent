@@ -91,6 +91,7 @@ class Config:
     write_dirs: list[str] = field(default_factory=list)
     max_session_turns: int = 30
     session_ttl_days: int = 7
+    reminder_channel_id: int = 0
     watches: list[WatchTarget] = field(default_factory=list)
 
     @property
@@ -281,6 +282,7 @@ def load_config(
         write_dirs=_require_write_dirs(raw),
         max_session_turns=_require_int(raw, "max_session_turns", 30),
         session_ttl_days=_require_int(raw, "session_ttl_days", 7),
+        reminder_channel_id=_require_int(raw, "reminder_channel_id", 0),
     )
     for watch in watches_raw:
         if not isinstance(watch, dict):
@@ -386,6 +388,14 @@ def validate_config(cfg: Config) -> None:
             "max_reply_chars must be <= 2000 when "
             f"reply_delivery='single_message' (got {cfg.max_reply_chars})"
         )
+    if (
+        isinstance(cfg.reminder_channel_id, bool)
+        or not isinstance(cfg.reminder_channel_id, int)
+        or cfg.reminder_channel_id < 0
+    ):
+        raise ValueError(
+            f"reminder_channel_id must be a non-negative integer (got {cfg.reminder_channel_id!r})"
+        )
     if not cfg.watches:
         raise ValueError("at least one watch target is required")
     seen_channels: set[int] = set()
@@ -475,6 +485,7 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
         f"write_dirs = {json.dumps(list(cfg.write_dirs))}",
         f"max_session_turns = {cfg.max_session_turns}",
         f"session_ttl_days = {cfg.session_ttl_days}",
+        f"reminder_channel_id = {cfg.reminder_channel_id}",
     ]
     for target in cfg.watches:
         lines.append("")

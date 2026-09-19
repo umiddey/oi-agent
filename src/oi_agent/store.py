@@ -134,6 +134,22 @@ CREATE TABLE IF NOT EXISTS agent_calibration (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_calibration_expires
     ON agent_calibration(expires_at);
+CREATE TABLE IF NOT EXISTS reminders (
+    source_message_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    creator_id INTEGER NOT NULL,
+    target_member_ids TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
+    next_due_at INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'completed')),
+    last_sent_at INTEGER,
+    claimed_until INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (length(target_member_ids) <= 1024)
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due
+    ON reminders(status, next_due_at, claimed_until);
 DROP TABLE IF EXISTS memory;
 DROP TABLE IF EXISTS messages;
 DROP TABLE IF EXISTS digests;
@@ -410,6 +426,151 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(int(ts)),),
         )
+    def create_reminder(
+        self,
+        source_message_id: int,
+        channel_id: int,
+        creator_id: int,
+        target_member_ids: list[int] | tuple[int, ...],
+        interval_seconds: int,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Persist one reminder declaration idempotently without source text.
+
+        Args:
+            source_message_id: Discord message that declared the reminder.
+            channel_id: Discord channel containing the declaration.
+            creator_id: Discord author ID.
+            target_member_ids: Optional bounded member IDs to mention.
+            interval_seconds: Positive repeat interval in seconds.
+            now: Optional test clock timestamp.
+
+        Returns:
+            True when inserted, False when the source message already exists.
+        """
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        targets = sorted({int(member_id) for member_id in target_member_ids if int(member_id) > 0})
+        encoded_targets = json.dumps(targets, separators=(",", ":"))
+        if len(encoded_targets) > 1024:
+            raise ValueError("target_member_ids exceeds storage bound")
+        timestamp = int(time.time() if now is None else now)
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO reminders("
+            "source_message_id, channel_id, creator_id, target_member_ids, interval_seconds, "
+            "next_due_at, status, created_at, updated_at"
+            ") VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            (
+                int(source_message_id),
+                int(channel_id),
+                int(creator_id),
+                encoded_targets,
+                int(interval_seconds),
+                timestamp + int(interval_seconds),
+                timestamp,
+                timestamp,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def get_reminder(self, source_message_id: int) -> dict[str, Any] | None:
+        """Return structured reminder metadata for one source message."""
+        row = self._conn.execute(
+            "SELECT source_message_id, channel_id, creator_id, target_member_ids, interval_seconds, "
+            "next_due_at, status, last_sent_at, claimed_until, created_at, updated_at "
+            "FROM reminders WHERE source_message_id=?",
+            (int(source_message_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "source_message_id": row[0],
+            "channel_id": row[1],
+            "creator_id": row[2],
+            "target_member_ids": tuple(json.loads(row[3])),
+            "interval_seconds": row[4],
+            "next_due_at": row[5],
+            "status": row[6],
+            "last_sent_at": row[7],
+            "claimed_until": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
+        }
+
+    def claim_due_reminders(
+        self,
+        *,
+        now: int | None = None,
+        limit: int = 20,
+        lease_seconds: int = 120,
+    ) -> list[dict[str, Any]]:
+        """Claim due active reminders atomically for one scheduler pass."""
+        if limit <= 0 or lease_seconds <= 0:
+            raise ValueError("limit and lease_seconds must be positive")
+        timestamp = int(time.time() if now is None else now)
+        rows = self._conn.execute(
+            "SELECT source_message_id FROM reminders "
+            "WHERE status='active' AND next_due_at<=? AND claimed_until<? "
+            "ORDER BY next_due_at, source_message_id LIMIT ?",
+            (timestamp, timestamp, int(limit)),
+        ).fetchall()
+        if not rows:
+            return []
+        ids = [int(row[0]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        self._conn.execute(
+            f"UPDATE reminders SET claimed_until=?, updated_at=? "
+            f"WHERE source_message_id IN ({placeholders}) AND status='active'",
+            [timestamp + lease_seconds, timestamp, *ids],
+        )
+        claimed = [self.get_reminder(source_id) for source_id in ids]
+        return [item for item in claimed if item is not None]
+
+    def advance_reminder(self, source_message_id: int, *, sent_at: int | None = None) -> bool:
+        """Advance an active reminder after confirmed Discord delivery."""
+        timestamp = int(time.time() if sent_at is None else sent_at)
+        cur = self._conn.execute(
+            "UPDATE reminders SET last_sent_at=?, next_due_at=?, claimed_until=0, updated_at=? "
+            "WHERE source_message_id=? AND status='active'",
+            (
+                timestamp,
+                timestamp
+                + int(
+                    self._conn.execute(
+                        "SELECT interval_seconds FROM reminders WHERE source_message_id=?",
+                        (int(source_message_id),),
+                    ).fetchone()[0]
+                ),
+                timestamp,
+                int(source_message_id),
+            ),
+        )
+        return cur.rowcount == 1
+
+    def release_reminder(self, source_message_id: int, *, retry_at: int | None = None) -> None:
+        """Release a failed reminder claim for a bounded retry."""
+        timestamp = int(time.time() if retry_at is None else retry_at)
+        self._conn.execute(
+            "UPDATE reminders SET next_due_at=?, claimed_until=0, updated_at=? "
+            "WHERE source_message_id=? AND status='active'",
+            (timestamp, timestamp, int(source_message_id)),
+        )
+
+    def set_reminder_completed(self, source_message_id: int, completed: bool) -> bool:
+        """Close or reopen a reminder from a completion-reaction state change."""
+        now = int(time.time())
+        cur = self._conn.execute(
+            "UPDATE reminders SET status=?, next_due_at=?, claimed_until=0, updated_at=? "
+            "WHERE source_message_id=?",
+            (
+                "completed" if completed else "active",
+                now if not completed else 0,
+                now,
+                int(source_message_id),
+            ),
+        )
+        return cur.rowcount == 1
 
     def get_member_profile(self, platform: str, scope_id: str, member_id: str) -> dict | None:
         """Retrieve a member's scoped dynamic profile traits."""

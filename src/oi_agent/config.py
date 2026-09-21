@@ -91,6 +91,8 @@ class Config:
     write_dirs: list[str] = field(default_factory=list)
     max_session_turns: int = 30
     session_ttl_days: int = 7
+    max_context_messages: int = 200
+    max_context_age_days: int = 30
     reminder_channel_id: int = 0
     watches: list[WatchTarget] = field(default_factory=list)
 
@@ -282,6 +284,8 @@ def load_config(
         write_dirs=_require_write_dirs(raw),
         max_session_turns=_require_int(raw, "max_session_turns", 30),
         session_ttl_days=_require_int(raw, "session_ttl_days", 7),
+        max_context_messages=_require_int(raw, "max_context_messages", 200),
+        max_context_age_days=_require_int(raw, "max_context_age_days", 30),
         reminder_channel_id=_require_int(raw, "reminder_channel_id", 0),
     )
     for watch in watches_raw:
@@ -375,11 +379,13 @@ def validate_config(cfg: Config) -> None:
             raise ValueError(f"write_dirs entries must be repo-relative without '..': {entry!r}")
     for name, minimum in (("max_reply_chars", 200), ("opencode_steps", 1),
                           ("opencode_timeout_seconds", 1), ("max_session_turns", 1),
-                          ("session_ttl_days", 0)):
+                          ("session_ttl_days", 0), ("max_context_messages", 40),
+                          ("max_context_age_days", 1)):
         value = getattr(cfg, name)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer (got {value!r})")
-        maximum = {"opencode_steps": 50, "opencode_timeout_seconds": 86_400}.get(name)
+        maximum = {"opencode_steps": 50, "opencode_timeout_seconds": 86_400,
+                   "max_context_messages": 1_000, "max_context_age_days": 365}.get(name)
         if value < minimum or (maximum is not None and value > maximum):
             bound = f"[{minimum}, {maximum}]" if maximum else f">= {minimum}"
             raise ValueError(f"{name} must be in {bound} (got {value})")
@@ -485,6 +491,8 @@ def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:
         f"write_dirs = {json.dumps(list(cfg.write_dirs))}",
         f"max_session_turns = {cfg.max_session_turns}",
         f"session_ttl_days = {cfg.session_ttl_days}",
+        f"max_context_messages = {cfg.max_context_messages}",
+        f"max_context_age_days = {cfg.max_context_age_days}",
         f"reminder_channel_id = {cfg.reminder_channel_id}",
     ]
     for target in cfg.watches:

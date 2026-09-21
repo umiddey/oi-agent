@@ -11,6 +11,7 @@ import signal
 import subprocess
 import time
 from contextlib import AsyncExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,12 @@ if TYPE_CHECKING:
 
 from ..agent.reply import Reply
 from ..config import Config, WatchTarget
+from ..watch.context_request import (
+    ContextRequest,
+    mentions_expansion,
+    parse_explicit_request,
+    parse_spec,
+)
 from .bootstrap import resolve_binary
 from .paths import resolve_opencode_paths
 from .policy import build_agent_config, normalize_write_dirs
@@ -41,6 +48,42 @@ MAX_STDERR_BYTES = 32 * 1024
 # Bounded stdin (plan Phase 8 item 6): prompts above this size fail closed
 # before any subprocess is spawned.
 MAX_PROMPT_BYTES = 256 * 1024
+
+# One-shot spec extraction for chat-driven context expansion (plan
+# 20260920_chat_context_expansion). The model only interprets; the harness
+# fetches, clamped by config caps. Output contract: one JSON object, nothing
+# else — parsed by watch.context_request.parse_spec which fails closed.
+_CONTEXT_SPEC_PROMPT_TEMPLATE = (
+    "You read a Discord message and extract only a conversation-history "
+    "window request. Today is {today}. Output ONLY one minified JSON object, "
+    "no prose, no markdown fences, exactly this shape:\n"
+    '{{"count": <integer|null>, "since_days": <integer|null>, '
+    '"since_date": <"YYYY-MM-DD"|null>}}\n'
+    'Rules: "count" = how many past messages to include (null if not asked); '
+    '"since_days" = whole-day look-back window for relative asks like "2 weeks '
+    'ago" (null if not asked); "since_date" = a NAMED calendar date converted '
+    'to YYYY-MM-DD — use the START of that day, e.g. "from 10th Sept 2026" -> '
+    '"2026-09-10", "after March 3" -> the year implied by context or today\'s '
+    'year. If asked to "read earlier", "go back further", or read the whole '
+    'thread without a number, set "count" to 200. '
+    'Examples: "read the last 100 messages" -> '
+    '{{"count":100,"since_days":null,"since_date":null}}; '
+    '"messages since 2 weeks ago" -> '
+    '{{"count":null,"since_days":14,"since_date":null}}; '
+    '"messages frm 10th Sept 2026 onwards" -> '
+    '{{"count":null,"since_days":null,"since_date":"2026-09-10"}}; '
+    '"read earlier" -> {{"count":200,"since_days":null,"since_date":null}}; '
+    '"summarize the thread" -> '
+    '{{"count":null,"since_days":null,"since_date":null}}.\n\n'
+    "Discord message:\n"
+)
+
+
+def _context_spec_prompt() -> str:
+    """Return the spec prompt anchored to today's UTC date."""
+    return _CONTEXT_SPEC_PROMPT_TEMPLATE.format(
+        today=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
 
 _repo_locks: dict[str, asyncio.Lock] = {}
 _repo_locks_guard = asyncio.Lock()
@@ -244,33 +287,21 @@ _TOOL_CALLS_REASON = "tool-calls"
 
 def _select_final_text(
     events: list[dict[str, Any]],
+    *,
+    allow_unfinished: bool = False,
 ) -> tuple[str, str | None, str | None, int]:
-    """Select exactly the final completed assistant message from parsed events.
+    """Select a completed answer, optionally accepting one clean terminal text event.
 
-    Supported event state machine (see the pinned contract above):
-    ``step_start(msg)`` opens an assistant message; ``reasoning``,
-    ``tool_use``, and ``text(msg)`` parts belong to the open message; and
-    ``step_finish(msg, reason)`` closes it. Once a message is closed, any
-    further text part for the same ``messageID`` is a protocol violation and
-    fails closed with ``protocol_malformed_part``; a new ``messageID`` after
-    a finish is a legitimate superseding message. Text parts are grouped by
-    their ``messageID`` and kept in stream arrival order. A message is a
-    final-answer candidate only when its ``step_finish`` reason is ``stop``
-    and it owns at least one visible (non-``synthetic``, non-``ignored``)
-    text part.
-    Reasoning parts, tool input/output, tool-loop narration, and superseded or
-    incomplete messages are discarded. Exactly one candidate is returned;
-    zero, multiple ambiguous, or structurally invalid streams yield a bounded
-    ``protocol_*`` error class instead of any text (fail closed).
+    Normal OI streams require a ``step_finish(reason="stop")`` event. Some
+    OpenCode standalone streams end after one visible text event; callers
+    may opt into accepting that exact single-message shape.
 
     Args:
         events: Parsed JSONL events in stream order.
+        allow_unfinished: Accept one unclosed visible-text message.
 
     Returns:
-        Tuple of (final text or "", session id, bounded error class or None,
-        count of visible text parts seen). The error class is set both for
-        in-stream ``error`` events and for protocol violations; no retained or
-        discarded text content is ever included.
+        Tuple of final text, session id, bounded error class, and visible part count.
     """
     session_id: str | None = None
     error_class: str | None = None
@@ -341,6 +372,16 @@ def _select_final_text(
         final = messages[candidates[0]]
         text = "".join(final["by_id"][pid] for pid in final["order"]).strip()
         return text, session_id, error_class, text_parts
+    if allow_unfinished and error_class is None:
+        open_candidates = [
+            message_id for message_id in order
+            if messages[message_id]["reason"] is None
+            and messages[message_id]["order"]
+        ]
+        if len(open_candidates) == 1:
+            final = messages[open_candidates[0]]
+            text = "".join(final["by_id"][pid] for pid in final["order"]).strip()
+            return text, session_id, None, text_parts
     for message_id in order:
         reason = messages[message_id]["reason"]
         if reason not in (None, _ANSWER_COMPLETED_REASON, _TOOL_CALLS_REASON):
@@ -649,12 +690,15 @@ class OpenCodeRunner:
         *,
         system_prompt: str = "",
         timeout: int = 60,
+        allow_unfinished: bool = False,
     ) -> str | None:
         """Execute a raw model query without repository tool access.
 
+        Args:
+            allow_unfinished: Accept one clean terminal text event from standalone OpenCode.
+
         Raises:
-            ValueError: When the prompt exceeds the bounded stdin limit; no
-                subprocess is spawned in that case (finding B10).
+            ValueError: When the prompt exceeds the bounded stdin limit.
         """
         prompt_bytes = prompt.encode("utf-8")
         if len(prompt_bytes) > MAX_PROMPT_BYTES:
@@ -683,7 +727,17 @@ class OpenCodeRunner:
             }
         }
         config_content = json.dumps(agent_def, separators=(",", ":"))
-        argv = [binary, "run", "--format", "json", "--model", self._cfg.opencode_model, "--agent", "oi_eval"]
+        argv = [
+            binary,
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--model",
+            self._cfg.opencode_model,
+            "--agent",
+            "oi_eval",
+        ]
         environment = paths.environment()
         environment["OPENCODE_CONFIG_CONTENT"] = config_content
 
@@ -711,7 +765,9 @@ class OpenCodeRunner:
                 timeout=timeout,
             )
             events, _ = stdout_task.result()
-            text, _, selection_error, _ = _select_final_text(events)
+            text, _, selection_error, _ = _select_final_text(
+                events, allow_unfinished=allow_unfinished
+            )
             if selection_error is None and text:
                 return text
             return None
@@ -731,6 +787,43 @@ class OpenCodeRunner:
             for task in (stdout_task, stderr_task):
                 if task is not None and not task.done():
                     task.cancel()
+
+    async def infer_context_request(self, question: str) -> ContextRequest | None:
+        """Interpret an explicit history ask locally, then use one LLM fallback.
+
+        Literal dates, counts, and relative windows are deterministic and do
+        not depend on a second provider call. Less literal expansion asks may
+        use the bounded JSON fallback; any fallback failure returns None.
+        """
+        direct_request = parse_explicit_request(question)
+        if direct_request is not None:
+            logger.info(
+                "[opencode] context expansion deterministic count=%s since_days=%s since_date=%s",
+                direct_request.count,
+                direct_request.since_days,
+                direct_request.since_date,
+            )
+            return direct_request
+        if not mentions_expansion(question):
+            return None
+        try:
+            text = await self.run_raw_prompt(
+                _context_spec_prompt() + question.strip(),
+                timeout=45,
+                allow_unfinished=True,
+            )
+        except ValueError:
+            return None
+        request = parse_spec(text)
+        if request is None or request.is_default:
+            return None
+        logger.info(
+            "[opencode] context expansion spec count=%s since_days=%s since_date=%s",
+            request.count,
+            request.since_days,
+            request.since_date,
+        )
+        return request
 
 
     async def _run_locked(

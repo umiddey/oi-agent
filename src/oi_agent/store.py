@@ -146,6 +146,9 @@ CREATE TABLE IF NOT EXISTS reminders (
     claimed_until INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    one_shot INTEGER NOT NULL DEFAULT 0,
+    at_hour INTEGER,
+    at_minute INTEGER,
     CHECK (length(target_member_ids) <= 1024)
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due
@@ -329,6 +332,13 @@ def _ensure_schema_compatibility(conn: sqlite3.Connection) -> None:
     session_columns = {row[1] for row in conn.execute("PRAGMA table_info(opencode_sessions)")}
     if "turns" not in session_columns:
         conn.execute("ALTER TABLE opencode_sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
+    reminder_columns = {row[1] for row in conn.execute("PRAGMA table_info(reminders)").fetchall()}
+    if "one_shot" not in reminder_columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0")
+    if "at_hour" not in reminder_columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN at_hour INTEGER")
+    if "at_minute" not in reminder_columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN at_minute INTEGER")
 
 
 class Store:
@@ -435,6 +445,10 @@ class Store:
         interval_seconds: int,
         *,
         now: int | None = None,
+        one_shot: bool = False,
+        at_hour: int | None = None,
+        at_minute: int | None = None,
+        first_due_at: int | None = None,
     ) -> bool:
         """Persist one reminder declaration idempotently without source text.
 
@@ -445,12 +459,25 @@ class Store:
             target_member_ids: Optional bounded member IDs to mention.
             interval_seconds: Positive repeat interval in seconds.
             now: Optional test clock timestamp.
+            one_shot: True for a single-fire reminder (auto-completes on delivery).
+            at_hour: Optional Berlin wall-clock hour (0-23) for daily fire times.
+            at_minute: Optional Berlin wall-clock minute (0-59).
+            first_due_at: Optional explicit first due timestamp (daily-at-time and
+                one-shot schedules); defaults to ``now + interval_seconds``.
 
         Returns:
             True when inserted, False when the source message already exists.
         """
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
+        if (at_hour is None) != (at_minute is None):
+            raise ValueError("at_hour and at_minute must be set together")
+        if at_hour is not None and not 0 <= int(at_hour) <= 23:
+            raise ValueError("at_hour must be in 0..23")
+        if at_minute is not None and not 0 <= int(at_minute) <= 59:
+            raise ValueError("at_minute must be in 0..59")
+        if first_due_at is not None and int(first_due_at) <= 0:
+            raise ValueError("first_due_at must be a positive timestamp")
         targets = sorted({int(member_id) for member_id in target_member_ids if int(member_id) > 0})
         encoded_targets = json.dumps(targets, separators=(",", ":"))
         if len(encoded_targets) > 1024:
@@ -459,17 +486,20 @@ class Store:
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO reminders("
             "source_message_id, channel_id, creator_id, target_member_ids, interval_seconds, "
-            "next_due_at, status, created_at, updated_at"
-            ") VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            "next_due_at, status, created_at, updated_at, one_shot, at_hour, at_minute"
+            ") VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
             (
                 int(source_message_id),
                 int(channel_id),
                 int(creator_id),
                 encoded_targets,
                 int(interval_seconds),
-                timestamp + int(interval_seconds),
+                int(first_due_at) if first_due_at is not None else timestamp + int(interval_seconds),
                 timestamp,
                 timestamp,
+                1 if one_shot else 0,
+                None if at_hour is None else int(at_hour),
+                None if at_minute is None else int(at_minute),
             ),
         )
         return cur.rowcount == 1
@@ -478,7 +508,8 @@ class Store:
         """Return structured reminder metadata for one source message."""
         row = self._conn.execute(
             "SELECT source_message_id, channel_id, creator_id, target_member_ids, interval_seconds, "
-            "next_due_at, status, last_sent_at, claimed_until, created_at, updated_at "
+            "next_due_at, status, last_sent_at, claimed_until, created_at, updated_at, "
+            "one_shot, at_hour, at_minute "
             "FROM reminders WHERE source_message_id=?",
             (int(source_message_id),),
         ).fetchone()
@@ -496,6 +527,9 @@ class Store:
             "claimed_until": row[8],
             "created_at": row[9],
             "updated_at": row[10],
+            "one_shot": bool(row[11]),
+            "at_hour": row[12],
+            "at_minute": row[13],
         }
 
     def claim_due_reminders(
@@ -548,6 +582,25 @@ class Store:
         )
         return cur.rowcount == 1
 
+    def advance_daily_reminder(self, source_message_id: int, *, sent_at: int | None = None) -> bool:
+        """Advance a daily-at-time reminder to its next Berlin wall-time occurrence."""
+        from .reminders import next_daily_occurrence
+
+        row = self._conn.execute(
+            "SELECT at_hour, at_minute FROM reminders WHERE source_message_id=? AND status='active'",
+            (int(source_message_id),),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return False
+        timestamp = int(time.time() if sent_at is None else sent_at)
+        next_due = next_daily_occurrence(int(row[0]), int(row[1]), timestamp)
+        cur = self._conn.execute(
+            "UPDATE reminders SET last_sent_at=?, next_due_at=?, claimed_until=0, updated_at=? "
+            "WHERE source_message_id=? AND status='active'",
+            (timestamp, next_due, timestamp, int(source_message_id)),
+        )
+        return cur.rowcount == 1
+
     def release_reminder(self, source_message_id: int, *, retry_at: int | None = None) -> None:
         """Release a failed reminder claim for a bounded retry."""
         timestamp = int(time.time() if retry_at is None else retry_at)
@@ -559,13 +612,25 @@ class Store:
 
     def set_reminder_completed(self, source_message_id: int, completed: bool) -> bool:
         """Close or reopen a reminder from a completion-reaction state change."""
+        from .reminders import next_daily_occurrence
+
         now = int(time.time())
+        next_due = 0
+        if not completed:
+            row = self._conn.execute(
+                "SELECT at_hour, at_minute FROM reminders WHERE source_message_id=?",
+                (int(source_message_id),),
+            ).fetchone()
+            if row is not None and row[0] is not None and row[1] is not None:
+                next_due = next_daily_occurrence(int(row[0]), int(row[1]), now)
+            else:
+                next_due = now
         cur = self._conn.execute(
             "UPDATE reminders SET status=?, next_due_at=?, claimed_until=0, updated_at=? "
             "WHERE source_message_id=?",
             (
                 "completed" if completed else "active",
-                now if not completed else 0,
+                next_due,
                 now,
                 int(source_message_id),
             ),

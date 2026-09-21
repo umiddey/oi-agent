@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +23,16 @@ import discord
 
 from ..config import Config, WatchTarget
 from ..opencode.runner import OpenCodeRunner, scope_id_for_target
+from .context_request import ContextRequestMemory, bounded_window
 from ..poster import Poster, split_message
 from ..reflection.engine import ReflectionEngine
 from ..reminders import (
     COMPLETION_EMOJIS,
-    format_interval,
+    format_schedule,
+    next_daily_occurrence,
     parse_reminder_declaration,
     render_reminder,
+    tomorrow_at,
 )
 from ..store import Store
 from .gate import Action, evaluate
@@ -147,8 +151,35 @@ def _message_evidence_line(message: discord.Message, bot_user_id: int = 0) -> st
     return (body or "(attachment/embed)")[:600]
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _chronological(messages: list) -> list:
+    """Return messages sorted oldest-first regardless of fetch direction.
+
+    Args:
+        messages: Fetched messages; ordering depends on the strategy used.
+
+    Returns:
+        list: Messages ordered by creation time then id. Messages missing
+        ``created_at`` sort first (fakes only; real messages always carry it).
+    """
+    return sorted(
+        messages,
+        key=lambda m: (
+            getattr(m, "created_at", None) is None,
+            getattr(m, "created_at", None) or _EPOCH,
+            getattr(m, "id", 0) or 0,
+        ),
+    )
+
+
 async def _thread_excerpt(
-    channel: discord.abc.Messageable, limit: int = EXCERPT_LIMIT, *, bot_user_id: int = 0
+    channel: discord.abc.Messageable,
+    limit: int = EXCERPT_LIMIT,
+    *,
+    bot_user_id: int = 0,
+    after: datetime | None = None,
 ) -> str:
     """Fetch bounded conversation excerpt with attachments and embeds.
 
@@ -156,6 +187,8 @@ async def _thread_excerpt(
         channel (discord.abc.Messageable): Discord channel or thread.
         limit (int): Maximum messages to retrieve.
         bot_user_id (int): Bot identity used to strip session command tokens.
+        after (datetime | None): Exclusive lower age bound; only messages
+            newer than this cutoff are included (chat-driven window widen).
 
     Returns:
         str: Chronological conversation history string.
@@ -163,23 +196,40 @@ async def _thread_excerpt(
     lines: list[str] = []
     try:
         if hasattr(channel, "history"):
-            history_iter = channel.history(limit=limit, oldest_first=False)
+            # Direction: count-only asks ("last 100") want the newest
+            # messages; a date window ("from Sept 10 onwards") wants the
+            # EARLIEST messages inside the window — newest-first would
+            # return recent chatter and drop the requested start of the
+            # window whenever the channel exceeds the cap.
+            oldest_first = after is not None
+            history_iter = channel.history(
+                limit=limit, oldest_first=oldest_first, after=after
+            )
             if hasattr(history_iter, "__aiter__"):
                 raw_messages: list[discord.Message] = []
                 async for m in history_iter:
                     raw_messages.append(m)
-                for msg in reversed(raw_messages):
-                    author = getattr(msg.author, "display_name", "unknown")
-                    line = _message_evidence_line(msg, bot_user_id)
-                    lines.append(f"[{msg.id}] {author}: {line}")
             elif asyncio.iscoroutine(history_iter):
                 raw_messages = await history_iter
-                for msg in reversed(raw_messages):
-                    author = getattr(msg.author, "display_name", "unknown")
-                    line = _message_evidence_line(msg, bot_user_id)
-                    lines.append(f"[{msg.id}] {author}: {line}")
+            else:
+                raw_messages = []
+            raw_messages = _chronological(raw_messages)
+            for msg in raw_messages:
+                author = getattr(msg.author, "display_name", "unknown")
+                line = _message_evidence_line(msg, bot_user_id)
+                lines.append(f"[{msg.id}] {author}: {line}")
         elif hasattr(channel, "_history"):
-            raw_messages = list(getattr(channel, "_history", []))[-limit:]
+            raw_messages = list(getattr(channel, "_history", []))
+            if after is not None:
+                raw_messages = [
+                    m for m in raw_messages
+                    if getattr(m, "created_at", None) is None
+                    or m.created_at >= after
+                ]
+                raw_messages = raw_messages[:limit]
+            else:
+                raw_messages = raw_messages[-limit:]
+            raw_messages = _chronological(raw_messages)
             for msg in raw_messages:
                 author = getattr(msg.author, "display_name", "unknown")
                 line = _message_evidence_line(msg, bot_user_id)
@@ -235,6 +285,7 @@ class OIWatcher(discord.Client):
         super().__init__(intents=intents)
         self._cfg = cfg
         self._store = store
+        self._context_requests = ContextRequestMemory()
         self._token = token
         self._runner = OpenCodeRunner(cfg, store)
         self._reflection_engine = ReflectionEngine(self._runner, store)
@@ -470,6 +521,53 @@ class OIWatcher(discord.Client):
                     if target is not None and owner_id is not None:
                         await self._reconcile_scope(thread, target, owner_id)
 
+    async def _expanded_excerpt(
+        self,
+        channel: discord.abc.Messageable,
+        question: str,
+        bot_user_id: int,
+        context_key: str | None = None,
+    ) -> str:
+        """Build the prompt excerpt, honoring a chat-driven window request.
+
+        The spec interpretation is one bounded model query, gated by a local
+        regex; every dimension is clamped against the configured caps
+        (``max_context_messages`` / ``max_context_age_days``). A fresh
+        request is remembered per conversation so anaphoric follow-ups
+        ("do it this time") reuse it; any failure falls open to the default
+        40-message window.
+        """
+        limit, after = EXCERPT_LIMIT, None
+        try:
+            request = await self._runner.infer_context_request(question)
+        except Exception:  # noqa: BLE001 - expansion is best-effort, never fatal
+            logger.warning(
+                "[watcher] context expansion inference failed; using default window",
+                exc_info=True,
+            )
+            request = None
+        if request is not None and not request.is_default:
+            if context_key:
+                self._context_requests.remember(context_key, request)
+        elif context_key:
+            remembered = self._context_requests.recall(context_key)
+            if remembered is not None:
+                request = remembered
+                logger.info(
+                    "[watcher] reusing remembered context window count=%s since_days=%s",
+                    request.count,
+                    request.since_days,
+                )
+        if request is not None:
+            limit, after = bounded_window(
+                request,
+                max_context_messages=self._cfg.max_context_messages,
+                max_context_age_days=self._cfg.max_context_age_days,
+            )
+        return await _thread_excerpt(
+            channel, limit, bot_user_id=bot_user_id, after=after
+        )
+
     async def _reconcile_scope(
         self,
         channel: discord.abc.Messageable,
@@ -586,20 +684,38 @@ class OIWatcher(discord.Client):
         if declaration is None:
             return False
         self._store.update_scope_cursor(str(message.channel.id), message.channel.id, message.id)
+        now = int(time.time())
+        first_due_at: int | None = None
+        if declaration.kind == "once" and declaration.hour is not None:
+            first_due_at = tomorrow_at(declaration.hour, declaration.minute or 0, now)
+        elif declaration.kind == "daily" and declaration.hour is not None:
+            first_due_at = next_daily_occurrence(declaration.hour, declaration.minute or 0, now)
         inserted = self._store.create_reminder(
             source_message_id=message.id,
             channel_id=message.channel.id,
             creator_id=getattr(message.author, "id", 0),
             target_member_ids=declaration.target_member_ids,
             interval_seconds=declaration.interval_seconds,
+            now=now,
+            one_shot=declaration.kind == "once",
+            at_hour=declaration.hour,
+            at_minute=declaration.minute,
+            first_due_at=first_due_at,
         )
         if inserted:
             target, owner = self._resolve_target(message.channel.id, message.channel)
             if target is not None and owner is not None:
-                acknowledgement = (
-                    f"✅ Reminder set for every {format_interval(declaration.interval_seconds)}. "
-                    "I’ll keep reminding here until the original message gets a completion tick."
-                )
+                schedule = format_schedule(declaration, first_due_at)
+                if declaration.kind == "once":
+                    acknowledgement = (
+                        f"✅ One-time reminder set for {schedule.removeprefix('once on ')}. "
+                        "I’ll post it here once."
+                    )
+                else:
+                    acknowledgement = (
+                        f"✅ Reminder set for {schedule}. "
+                        "I’ll keep reminding here until the original message gets a completion tick."
+                    )
                 result = await Poster(self._cfg, self._store, self._token).deliver_chunk(
                     channel_id=message.channel.id,
                     target_channel_id=owner,
@@ -644,12 +760,14 @@ class OIWatcher(discord.Client):
                         self._store.release_reminder(source_id, retry_at=int(time.time()) + 60)
                         continue
                     next_due = int(reminder["next_due_at"])
+                    one_shot = bool(reminder.get("one_shot"))
                     body = render_reminder(
                         declaration.task_text,
                         source_id,
                         channel.id,
                         reminder["target_member_ids"],
                         next_due,
+                        one_shot=one_shot,
                     )
                     nonce = f"r-{uuid.uuid5(uuid.NAMESPACE_URL, f'{source_id}:{next_due}').hex[:20]}"
                     result = await Poster(self._cfg, self._store, self._token).deliver_chunk(
@@ -660,7 +778,12 @@ class OIWatcher(discord.Client):
                         reply_to_message_id=source_id,
                     )
                     if result.ok:
-                        self._store.advance_reminder(source_id)
+                        if one_shot:
+                            self._store.set_reminder_completed(source_id, True)
+                        elif reminder.get("at_hour") is not None and reminder.get("at_minute") is not None:
+                            self._store.advance_daily_reminder(source_id)
+                        else:
+                            self._store.advance_reminder(source_id)
                     else:
                         self._store.release_reminder(source_id, retry_at=int(time.time()) + 60)
             except asyncio.CancelledError:
@@ -1008,7 +1131,10 @@ class OIWatcher(discord.Client):
                 prompt_content,
                 list(getattr(trigger_message, "mentions", None) or ()),
             )
-            excerpt = await _thread_excerpt(ch, bot_user_id=command_bot_id)
+            excerpt = await self._expanded_excerpt(
+                ch, question, command_bot_id,
+                context_key=f"{conversation_id}:{repo_path}",
+            )
             # Ground-truth self identity for the prompt: the display name the
             # bot actually posts under in this conversation (guild nickname
             # aware) plus its stable user id.
